@@ -1,162 +1,67 @@
-import tensorflow.keras as kr
-from tensorflow.keras import layers, Input
+from tensorflow.keras.layers import (
+    Input,
+    Conv1D,
+    Concatenate,
+    BatchNormalization,
+    SpatialDropout1D,
+    GRU,
+    Dense,
+    Softmax,
+)
 from tensorflow.keras.models import Model
 
-## Based on source: https://github.com/aguscerdo/EE239AS-Project
 
-def net(config, inception=True, res=True, strided=True, maxpool=False, avgpool=False, batchnorm=True):
-    assert (hasattr(config, 'data_format') and
-            hasattr(config, 'fs') and
-            hasattr(config, 'frame') and
-            hasattr(config, 'CH') and
-            hasattr(config, 'dropoutRate'))
+def net(config):
+    """
+    ChronoNet-style architecture for 3-class classification:
+    0 = interictal, 1 = pre-ictal, 2 = ictal.
+    """
 
-    input_shape = (config.frame * config.fs, config.CH)
+    n_samples = int(config.frame * config.fs)
+    n_ch = config.CH  # should be 2 (focal + cross)
 
-    pad = 'same'
-    padp = 'same'
-    config.state_size = 32
-    config.filters = 32
-    config.strides = 2
-    config.c_act = 'relu'
-    config.r_act = 'sigmoid'
-    config.rk_act = 'tanh'
+    inp = Input(shape=(n_samples, n_ch), name="input_layer")
 
-    config.rec_drop = 0
-    config.cnn_drop = 0.6
+    # ---- Block 1: multi-scale temporal conv ----
+    c1 = Conv1D(32, kernel_size=5, strides=2, padding="same", activation="relu")(inp)
+    c2 = Conv1D(32, kernel_size=9, strides=2, padding="same", activation="relu")(inp)
+    c3 = Conv1D(32, kernel_size=17, strides=2, padding="same", activation="relu")(inp)
 
-    r = kr.regularizers.l2(config.l2)
-    stride_size = config.strides if strided else 1
+    x = Concatenate(name="concat_1")([c1, c2, c3])
+    x = BatchNormalization()(x)
+    x = SpatialDropout1D(0.2)(x)
 
-    input = Input(input_shape)
+    # ---- Block 2 ----
+    c4 = Conv1D(32, kernel_size=5, strides=2, padding="same", activation="relu")(x)
+    c5 = Conv1D(32, kernel_size=9, strides=2, padding="same", activation="relu")(x)
+    c6 = Conv1D(32, kernel_size=17, strides=2, padding="same", activation="relu")(x)
 
-    if inception:
-        c0 = layers.Conv1D(config.filters, kernel_size=2, strides=stride_size, padding=pad,
-                           activation=config.c_act)(input)
-        c1 = layers.Conv1D(config.filters, kernel_size=4, strides=stride_size, padding=pad,
-                           activation=config.c_act)(input)
-        c2 = layers.Conv1D(config.filters, kernel_size=8, strides=stride_size, padding=pad,
-                           activation=config.c_act)(input)
+    x = Concatenate(name="concat_2")([c4, c5, c6])
+    x = BatchNormalization()(x)
+    x = SpatialDropout1D(0.2)(x)
 
-        c = layers.concatenate([c0, c1, c2])
+    # ---- Block 3 ----
+    c7 = Conv1D(32, kernel_size=5, strides=2, padding="same", activation="relu")(x)
+    c8 = Conv1D(32, kernel_size=9, strides=2, padding="same", activation="relu")(x)
+    c9 = Conv1D(32, kernel_size=17, strides=2, padding="same", activation="relu")(x)
 
-        if maxpool:
-            c = layers.MaxPooling1D(2, padding=padp)(c)
-        elif avgpool:
-            c = layers.AveragePooling1D(2, padding=padp)(c)
-        if batchnorm:
-            c = layers.BatchNormalization()(c)
+    x = Concatenate(name="concat_3")([c7, c8, c9])
+    x = BatchNormalization()(x)
+    x = SpatialDropout1D(0.2)(x)
 
-        c = layers.SpatialDropout1D(config.cnn_drop)(c)
+    # ---- Recurrent stack ----
+    g1 = GRU(32, return_sequences=True)(x)
+    g2 = GRU(32, return_sequences=True)(g1)
+    g_cat = Concatenate(name="gru_concat")([g1, g2])
+    g3 = GRU(32, return_sequences=True)(g_cat)
+    g_cat2 = Concatenate(name="gru_concat2")([g1, g2, g3])
 
+    g_final = GRU(32, return_sequences=False)(g_cat2)
 
-        c0 = layers.Conv1D(config.filters, kernel_size=2, strides=stride_size, padding=pad,
-                           activation=config.c_act)(c)
-        c1 = layers.Conv1D(config.filters, kernel_size=4, strides=stride_size, padding=pad,
-                           activation=config.c_act)(c)
-        c2 = layers.Conv1D(config.filters, kernel_size=8, strides=stride_size, padding=pad,
-                           activation=config.c_act)(c)
+    # ---- Output: 3 classes softmax ----
+    logits = Dense(3, name="dense")(g_final)
+    out = Softmax(name="softmax")(logits)
 
-        c = layers.concatenate([c0, c1, c2])
-
-        if maxpool:
-            c = layers.MaxPooling1D(2, padding=padp)(c)
-        elif avgpool:
-            c = layers.AveragePooling1D(2, padding=padp)(c)
-        if batchnorm:
-            c = layers.BatchNormalization()(c)
-
-        c = layers.SpatialDropout1D(config.cnn_drop)(c)
-
-
-        c0 = layers.Conv1D(config.filters, kernel_size=2, strides=stride_size, padding=pad,
-                           activation=config.c_act)(c)
-        c1 = layers.Conv1D(config.filters, kernel_size=4, strides=stride_size, padding=pad,
-                           activation=config.c_act)(c)
-        c2 = layers.Conv1D(config.filters, kernel_size=8, strides=stride_size, padding=pad,
-                           activation=config.c_act)(c)
-
-        c = layers.concatenate([c0, c1, c2])
-
-        if maxpool:
-            c = layers.MaxPooling1D(2, padding=padp)(c)
-        elif avgpool:
-            c = layers.AveragePooling1D(2, padding=padp)(c)
-        if batchnorm:
-            c = layers.BatchNormalization()(c)
-
-        c = layers.SpatialDropout1D(config.cnn_drop)(c)
-
-
-    else:  # No inception Modules
-        c = layers.Conv1D(config.filters, kernel_size=4, strides=stride_size, padding=pad, activation=config.c_act)(
-            input)
-        if maxpool:
-            c = layers.MaxPooling1D(2, padding=padp)(c)
-        elif avgpool:
-            c = layers.AveragePooling1D(2, padding=padp)(c)
-        if batchnorm:
-            c = layers.BatchNormalization()(c)
-        c = layers.SpatialDropout1D(config.cnn_drop)(c)
-
-        c = layers.Conv1D(config.filters, kernel_size=4, strides=stride_size, padding=pad, activation=config.c_act)(c)
-        if maxpool:
-            c = layers.MaxPooling1D(2, padding=padp)(c)
-        elif avgpool:
-            c = layers.AveragePooling1D(2, padding=padp)(c)
-        if batchnorm:
-            c = layers.BatchNormalization()(c)
-        c = layers.SpatialDropout1D(config.cnn_drop)(c)
-
-        c = layers.Conv1D(config.filters, kernel_size=4, strides=stride_size, padding=pad, activation=config.c_act)(c)
-        if maxpool:
-            c = layers.MaxPooling1D(2, padding=padp)(c)
-        elif avgpool:
-            c = layers.AveragePooling1D(2, padding=padp)(c)
-        if batchnorm:
-            c = layers.BatchNormalization()(c)
-        c = layers.SpatialDropout1D(config.cnn_drop)(c)
-
-    if res:  # Residual RNN
-        g1 = layers.GRU(config.state_size, return_sequences=True, activation=config.rk_act,
-                        recurrent_activation=config.r_act, dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                        recurrent_regularizer=r, kernel_regularizer=r)(c)
-        g2 = layers.GRU(config.state_size, return_sequences=True, activation=config.rk_act,
-                        recurrent_activation=config.r_act, dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                        recurrent_regularizer=r, kernel_regularizer=r)(g1)
-
-        g_concat1 = layers.concatenate([g1, g2])
-
-        g3 = layers.GRU(config.state_size, return_sequences=True, activation=config.rk_act, recurrent_activation=config.r_act,
-                        dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                        recurrent_regularizer=r, kernel_regularizer=r)(g_concat1)
-
-        g_concat2 = layers.concatenate([g1, g2, g3])
-
-        g = layers.GRU(config.state_size, return_sequences=False, activation=config.rk_act, recurrent_activation=config.r_act,
-                       dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                       recurrent_regularizer=r, kernel_regularizer=r)(g_concat2)
-
-    else:  # No Residual RNN
-        g = layers.GRU(config.state_size, return_sequences=True, activation=config.rk_act, recurrent_activation=config.r_act,
-                       dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                       recurrent_regularizer=r, kernel_regularizer=r)(c)
-
-        g = layers.GRU(config.state_size, return_sequences=True, activation=config.rk_act, recurrent_activation=config.r_act,
-                       dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                       recurrent_regularizer=r, kernel_regularizer=r)(g)
-        g = layers.GRU(config.state_size, return_sequences=True, activation=config.rk_act, recurrent_activation=config.r_act,
-                       dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                       recurrent_regularizer=r, kernel_regularizer=r)(g)
-
-        g = layers.GRU(config.state_size, return_sequences=False, activation=config.rk_act, recurrent_activation=config.r_act,
-                       dropout=config.rec_drop, recurrent_dropout=config.rec_drop,
-                       recurrent_regularizer=r, kernel_regularizer=r)(g)
-
-    d = layers.Dense(2)(g)
-    out = layers.Softmax()(d)
-
-    model = Model(input, out)
+    model = Model(inputs=inp, outputs=out, name="ChronoNet_3class")
 
     return model
-

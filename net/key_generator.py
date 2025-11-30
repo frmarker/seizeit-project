@@ -5,90 +5,50 @@ from classes.annotation import Annotation
 
 
 def generate_data_keys_sequential(config, recs_list, verbose=True):
-    """Create data segment keys in a sequential time manner. The keys are 4 element lists corresponding to the file index in the 'recs_list', the start and stop in seconds of the segment and it's label.
-
-        Args:
-            config (cls): config object with the experiment's parameters.
-            recs_list (list[list[str]]): a list of recording IDs in the format [sub-xxx, run-xx]
-        Returns:
-            segments: a list of data segment keys with [recording index, start, stop, label]
     """
-    
+    Create data segment keys in a sequential time manner.
+
+    Each key: [recording index, start (s), stop (s), label]
+
+    NEW BEHAVIOUR:
+    - Label = 1 for segments whose start time is within 30 seconds BEFORE an event onset
+    - Label = 0 otherwise
+    """
     segments = []
+    PRE_EVENT_WINDOW = 30.0  # seconds
 
-    for idx, f in tqdm(enumerate(recs_list), disable = not verbose):
+    for idx, f in tqdm(enumerate(recs_list), disable=not verbose):
         annotations = Annotation.loadAnnotation(config.data_path, f)
+        rec_dur = float(annotations.rec_duration)
 
-        if not annotations.events:
-            n_segs = int(np.floor((np.floor(annotations.rec_duration) - config.frame)/config.stride))
-            seg_start = np.arange(0, n_segs)*config.stride
-            seg_stop = seg_start + config.frame
+        # --- 1. Create sequential segments across the whole recording ---
+        # same logic as the "no events" branch before
+        n_segs = int(np.floor((np.floor(rec_dur) - config.frame) / config.stride))
+        if n_segs <= 0:
+            continue
 
-            segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.zeros(n_segs))))
-        else:
-            if len(annotations.events) == 1:
-                ev = annotations.events[0]
-                n_segs = int(np.floor((ev[0])/config.stride)-1)
-                seg_start = np.arange(0, n_segs)*config.stride
-                seg_stop = seg_start + config.frame
-                segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.zeros(n_segs))))
+        seg_start = np.arange(0, n_segs) * config.stride
+        seg_stop  = seg_start + config.frame
 
-                n_segs = int(np.floor((ev[1] - ev[0])/config.stride) + 1)
-                seg_start = np.arange(0, n_segs)*config.stride + ev[0] - config.stride
-                seg_stop = seg_start + config.frame
-                segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.ones(n_segs))))
+        # initialise all labels to 0 (non-pre-ictal)
+        labels = np.zeros(n_segs, dtype=int)
 
-                n_segs = int(np.floor(np.floor(annotations.rec_duration - ev[1])/config.stride)-1)
-                seg_start = np.arange(0, n_segs)*config.stride + ev[1]
-                seg_stop = seg_start + config.frame
-                segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.zeros(n_segs))))
-            else:
-                for e, ev in enumerate(annotations.events):
-                    if e == 0:
-                        n_segs = int(np.floor((ev[0])/config.stride)-1)
-                        if n_segs < 0:
-                            n_segs = 0
-                        seg_start = np.arange(0, n_segs)*config.stride
-                        seg_stop = seg_start + config.frame
-                        segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.zeros(n_segs))))
+        # --- 2. If there are events, mark pre-event windows as label 1 ---
+        if annotations.events:
+            for ev in annotations.events:
+                event_start = float(ev[0])  # onset in seconds
 
-                        n_segs = int(np.floor((ev[1] - ev[0])/config.stride)+1)
-                        seg_start = np.arange(0, n_segs)*config.stride + ev[0] - config.stride
-                        if np.sum(seg_start<0) > 0:
-                            n_segs -= np.sum(seg_start<0)
-                            seg_start = seg_start[seg_start>=0]
-                        seg_stop = seg_start + config.frame
-                        segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.ones(n_segs))))
+                # 30-second window before the event, clipped at 0
+                pre_start = max(0.0, event_start - PRE_EVENT_WINDOW)
+                pre_end   = event_start
 
-                    elif e != len(annotations.events)-1:
-                        prev_event = annotations.events[e-1]
-                        n_segs = int(np.floor((ev[0] - prev_event[1])/config.stride)-1)
-                        seg_start = np.arange(0, n_segs)*config.stride + prev_event[1]
-                        seg_stop = seg_start + config.frame
-                        segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.zeros(n_segs))))
+                # mark segments whose START lies in [pre_start, pre_end)
+                in_window = (seg_start >= pre_start) & (seg_start < pre_end)
+                labels[in_window] = 1
 
-                        n_segs = int(np.floor((ev[1] - ev[0])/config.stride)+1)
-                        seg_start = np.arange(0, n_segs)*config.stride + ev[0] - config.stride
-                        seg_stop = seg_start + config.frame
-                        segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.ones(n_segs))))
-
-                    elif e == len(annotations.events)-1:
-                        prev_event = annotations.events[e-1]
-                        n_segs = int(np.floor((ev[0] - prev_event[1])/config.stride)-1)
-                        seg_start = np.arange(0, n_segs)*config.stride + prev_event[1]
-                        seg_stop = seg_start + config.frame
-                        segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.zeros(n_segs))))
-
-                        n_segs = int(np.floor((ev[1] - ev[0])/config.stride)+1)
-                        seg_start = np.arange(0, n_segs)*config.stride + ev[0] - config.stride
-                        seg_stop = seg_start + config.frame
-                        segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.ones(n_segs))))
-
-                        n_segs = int(np.floor((annotations.rec_duration - ev[1])/config.stride)-1)
-                        if n_segs > 0:
-                            seg_start = np.arange(0, n_segs)*config.stride + ev[1]
-                            seg_stop = seg_start + config.frame
-                            segments.extend(np.column_stack(([idx]*n_segs, seg_start, seg_stop, np.zeros(n_segs))))
+        # --- 3. Store segments for this recording ---
+        seg_keys = np.column_stack(([idx] * n_segs, seg_start, seg_stop, labels))
+        segments.extend(seg_keys)
 
     return segments
 
