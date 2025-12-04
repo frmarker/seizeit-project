@@ -26,11 +26,9 @@ from net.utils import (
 
 
 def train_net(config, model, gen_train, gen_val, model_save_path):
-    """
-    Routine to train the model with the desired configurations.
-    """
 
-    K.set_image_data_format("channels_last")
+
+    K.set_image_data_format('channels_last')
     model.summary()
 
     name = config.get_name()
@@ -41,10 +39,10 @@ def train_net(config, model, gen_train, gen_val, model_save_path):
 
     # 3-class focal loss
     loss = weighted_focal_loss
-    auc = AUC(name="auc")
+    auc = AUC(name='auc')
 
     metrics = [
-        "accuracy",
+        'accuracy',
         auc,
         sens,
         spec,
@@ -55,23 +53,23 @@ def train_net(config, model, gen_train, gen_val, model_save_path):
         score,
     ]
 
-    monitor = "val_score"
-    monitor_mode = "max"
+    monitor = 'val_score'
+    monitor_mode = 'max'
 
     early_stopping = True
     patience = 10
 
-    callbacks_dir = os.path.join(model_save_path, "Callbacks")
-    history_dir = os.path.join(model_save_path, "History")
-    weights_dir = os.path.join(model_save_path, "Weights")
+    callbacks_dir = os.path.join(model_save_path, 'Callbacks')
+    history_dir = os.path.join(model_save_path, 'History')
+    weights_dir = os.path.join(model_save_path, 'Weights')
 
     os.makedirs(callbacks_dir, exist_ok=True)
     os.makedirs(history_dir, exist_ok=True)
     os.makedirs(weights_dir, exist_ok=True)
 
-    # Keras 3: save_weights_only requires .weights.h5
-    cb_model = os.path.join(callbacks_dir, name + "_{epoch:02d}.weights.h5")
-    csv_logger = CSVLogger(os.path.join(history_dir, name + ".csv"), append=True)
+    # Save_weights_only requires .weights.h5
+    cb_model = os.path.join(callbacks_dir, name + '_{epoch:02d}.weights.h5')
+    csv_logger = CSVLogger(os.path.join(history_dir, name + '.csv'), append=True)
 
     model.compile(
         loss=loss,
@@ -109,54 +107,83 @@ def train_net(config, model, gen_train, gen_val, model_save_path):
         callbacks=callbacks_list,
         shuffle=False,
         verbose=1,
-        class_weight=getattr(config, "class_weights", None),
+        class_weight=getattr(config, 'class_weights', None),
     )
 
     # Pick best epoch by highest val_score
-    best_epoch = int(np.argmax(hist.history["val_score"])) + 1
+    best_epoch = int(np.argmax(hist.history['val_score'])) + 1
     best_weights_path = cb_model.format(epoch=best_epoch)
 
     best_model = model
     best_model.load_weights(best_weights_path)
 
     # Save final best weights
-    final_weights_path = os.path.join(weights_dir, name + ".weights.h5")
+    final_weights_path = os.path.join(weights_dir, name + '.weights.h5')
     best_model.save_weights(final_weights_path)
 
-    print(f"Saved best model weights to {final_weights_path}")
+    print(f'Saved best model weights to {final_weights_path}')
 
 
 def predict_net(generator, model_weights_path, model):
-    """
-    Routine to obtain predictions from the trained model.
 
-    Returns:
-        y_pred: 1D array of pre-ictal probabilities (class 1)
-        y_true: 1D array of binary labels (1 = pre-ictal, 0 = other)
-    """
-
-    K.set_image_data_format("channels_last")
+    # Load trained weights
     model.load_weights(model_weights_path)
 
-    # collect true labels from generator (one-hot [N,3])
-    y_aux = []
-    for j in range(len(generator)):
-        _, y = generator[j]
-        if y is not None and len(y) > 0:
-            y_aux.append(y)
+    # Collect true labels from generator (typically one-hot [N, 3])
+    # We iterate over the Sequence so the order matches model.predict().
+    y_batches = []
+    for i in range(len(generator)):
+        batch = generator[i]
 
-    if len(y_aux) == 0:
-        # no data in generator – return empty arrays
+        # Expect (x, y) or (inputs, targets)
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            x, y = batch[0], batch[1]
+        else:
+            # Fallback: treat as (x, y)
+            x, y = batch
+
+        if y is None:
+            continue
+
+        # In case of multi-output generators, take the first output
+        if isinstance(y, (list, tuple)):
+            if len(y) == 0:
+                continue
+            y = y[0]
+
+        y = np.asarray(y)
+        if y.size == 0:
+            continue
+
+        y_batches.append(y)
+
+    if len(y_batches) == 0:
+        # No data in generator – return empty arrays
         return np.array([]), np.array([])
 
-    true_labels = np.vstack(y_aux)  # [N,3]
+    true_labels = np.concatenate(y_batches, axis=0)  
+    
+    # Get predictions from the model
+    prediction = model.predict(generator, verbose=1) 
+    # Ensure same length on both arrays (guard against any off-by-one)
+    n = min(len(true_labels), len(prediction))
+    true_labels = true_labels[:n]
+    prediction = prediction[:n]
 
-    prediction = model.predict(generator, verbose=0)  # [N,3]
 
-    # Pre-ictal probability = class 1
-    y_pred = prediction[:, 1].astype("float32")
+    # Reduce to pre-ictal probability (class index 1) and binary label  
+    if prediction.ndim == 2 and prediction.shape[1] >= 2:
+        # class 1 = pre-ictal
+        y_pred = prediction[:, 1].astype('float32')
+    else:
+        # Fallback: treat scalar output as "pre-ictal probability"
+        y_pred = prediction.astype('float32').flatten()
 
-    # Convert one-hot to binary mask for class 1
-    y_true = true_labels[:, 1].astype("float32")
+    if true_labels.ndim == 2 and true_labels.shape[1] >= 2:
+        # Convert one-hot labels to binary mask for pre-ictal
+        y_true = true_labels[:, 1].astype('float32')
+    else:
+        # Assume labels are already binary 0/1
+        y_true = true_labels.astype('float32').flatten()
 
     return y_pred, y_true

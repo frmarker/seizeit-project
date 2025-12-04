@@ -1,7 +1,9 @@
+# Updated main_net.py with generator caching, consistent segmentation, and lower learning rate
 import os
 import gc
 import time
 import pickle
+import argparse
 
 import h5py
 import numpy as np
@@ -18,29 +20,163 @@ from net.key_generator import (
 from net.generator_ds import SegmentedGenerator, SequentialGenerator
 from net.routines import train_net, predict_net
 from net.utils import apply_preprocess_eeg
+
 from classes.data import Data
+
+print('[main_net] File imported and top-level code reached.')
+
+# Remap segment labels for binary task: 0 = interictal and seizure, 1 = pre-ictal
+def remap_labels_to_binary_preictal(segments):
+
+    if segments is None:
+        return None
+    for seg in segments:
+        lbl = int(seg[3])
+        seg[3] = 1 if lbl == 1 else 0
+    return segments
+
+# Helper functions to inspect label distributions in generators
+def check_train_labels(train_generator, seizure_class_idx=1, max_batches=None):
+
+    total_pos = 0
+    total_neg = 0
+    total_samples = 0
+
+    num_batches = len(train_generator) if hasattr(train_generator, "__len__") else None
+
+    for b, (_, y) in enumerate(train_generator):
+        if max_batches is not None and b >= max_batches:
+            break
+
+        # If y is one-hot, convert to class indices
+        labels = np.argmax(y, axis=1)
+
+        total_pos += np.sum(labels == seizure_class_idx)
+        total_neg += np.sum(labels != seizure_class_idx)
+        total_samples += labels.shape[0]
+
+        if num_batches is not None and (b + 1) >= num_batches:
+            break
+
+    print('=== Training generator label check ===')
+    print(f'Total windows in train: {total_samples}')
+    print(f'Seizure windows (class {seizure_class_idx}): {total_pos}')
+    print(f'Non-seizure windows: {total_neg}')
+    if total_samples > 0:
+        print(f'Seizure fraction: {total_pos / total_samples:.4f}')
+
+
+def check_val_labels(val_generator, seizure_class_idx=1, max_batches=None):
+
+    total_pos = 0
+    total_neg = 0
+    total_samples = 0
+
+    num_batches = len(val_generator) if hasattr(val_generator, "__len__") else None
+
+    for b, (_, y) in enumerate(val_generator):
+        if max_batches is not None and b >= max_batches:
+            break
+
+        # If y is one-hot, convert to class indices
+        labels = np.argmax(y, axis=1)
+
+        total_pos += np.sum(labels == seizure_class_idx)
+        total_neg += np.sum(labels != seizure_class_idx)
+        total_samples += labels.shape[0]
+
+        if num_batches is not None and (b + 1) >= num_batches:
+            break
+
+    print('=== Validation generator label check ===')
+    print(f'Total windows in val: {total_samples}')
+    print(f' Seizure windows (class {seizure_class_idx}): {total_pos}')
+    print(f' Non-seizure windows: {total_neg}')
+    if total_samples > 0:
+        print(f'  Seizure fraction: {total_pos / total_samples:.4f}')
+
+# Helper function to plot EEG with event boundaries and 30s pre-ictal window
+def plot_eeg_with_events_and_preictal(config, recs_list, segments, target_rec_idx, pre_len=30.0):
+
+    import matplotlib
+    matplotlib.use('Agg')  # headless backend
+    import matplotlib.pyplot as plt
+
+    # Get recording ID and load raw EEG
+    rec = recs_list[target_rec_idx]
+    rec_data = Data.loadData(config.data_path, rec, modalities=['eeg'])
+
+    # Apply standard preprocessing to obtain focal / cross channels
+    try:
+        ch_focal, ch_cross = apply_preprocess_eeg(config, rec_data)
+    except Exception as e:
+        print(f'Could not preprocess EEG for plot ({rec[0]} {rec[1]}): {e}')
+        return
+
+    fs = config.fs
+    n_samples = len(ch_focal)
+    if n_samples == 0:
+        print(f'No samples in focal channel for {rec[0]} {rec[1]} - skipping plot.')
+        return
+
+    t = np.arange(n_samples) / fs
+
+    # Collect ictal segments for this recording
+    ictal_segs = [s for s in segments if int(s[0]) == int(target_rec_idx) and int(s[3]) == 2]
+    if not ictal_segs:
+        print(f'No ictal segments for {rec[0]} {rec[1]} - nothing to plot.')
+        return
+
+    seizure_start = min(s[1] for s in ictal_segs)
+    seizure_end = max(s[2] for s in ictal_segs)
+    pre_start = max(seizure_start - pre_len, 0.0)
+
+    # Select a plotting window around the seizure
+    window_start = max(pre_start - 30.0, 0.0)  # 30s padding before pre-ictal
+    window_end   = min(seizure_end + 30.0, t[-1])  # 30s padding after seizure
+
+    start_idx = int(window_start * fs)
+    end_idx   = int(window_end * fs)
+
+    t_win        = t[start_idx:end_idx]
+    ch_focal_win = ch_focal[start_idx:end_idx]
+    ch_cross_win = ch_cross[start_idx:end_idx]
+
+    # Create plot
+    plt.figure(figsize = (12, 6))
+    plt.plot(t_win, ch_focal_win, label='Focal channel')
+    plt.plot(t_win, ch_cross_win, label='Cross channel', alpha=0.7)
+
+    # Shade pre-ictal and ictal windows (in absolute time coordinates)
+    plt.axvspan(pre_start, seizure_start, alpha = 0.3, label='Pre-ictal window')
+    plt.axvspan(seizure_start, seizure_end, alpha = 0.3, label='Ictal period')
+
+    plt.xlabel('Time [s]')
+    plt.ylabel('Amplitude [a.u.]')
+    plt.title(f'EEG with events and 30s pre-ictal window: {rec[0]} {rec[1]}')
+    plt.legend(loc = 'upper right')
+    plt.tight_layout()
+
+    plots_dir = os.path.join(config.save_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    out_name = f"{rec[0]}_{rec[1]}_preictal_plot.png"
+    out_path = os.path.join(plots_dir, out_name)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+    print(f'Saved EEG + event + pre-ictal plot to {out_path}')
 
 
 def train(config, load_generators, save_generators):
-    """ Routine to run the model's training routine.
 
-        Args:
-            config (cls): a config object with the data input type and model parameters
-            load_generators (bool): boolean to load the training and validation generators from file
-            save_generators (bool): boolean to save the training and validation generators
-    """
+    print(f'[train] Starting train() for exp name: {config.get_name()}')
 
     name = config.get_name()
 
-    # Select model
-    if config.model == 'ChronoNet':
-        from net.ChronoNet import net
-    elif config.model == 'EEGnet':
-        from net.EEGnet import net
-    elif config.model == 'DeepConvNet':
-        from net.DeepConv_Net import net
-    else:
-        raise ValueError(f"Unknown model type: {config.model}")
+    # Select model (ChronoNet ONLY)
+    from net.ChronoNet import net
+    # Force config.model to ChronoNet for consistency
+    config.model = 'ChronoNet'
 
     # Ensure save dirs
     if not os.path.exists(os.path.join(config.save_dir, 'models')):
@@ -57,155 +193,132 @@ def train(config, load_generators, save_generators):
     # Save config used for this run
     config.save_config(save_path=config_path)
 
-    #######################################################################################################################
-    ### Fixed train/val/test ###
-    #######################################################################################################################
-    if config.cross_validation == 'fixed':
+    # Train/val/test
+    if config.dataset == 'SZ2':
+            # Build subject splits directly from the dataset directory,
+            # avoiding any dependency on SZ2_training.tsv / SZ2_validation.tsv.
+            print('[train] Building subject splits directly from dataset folder (ignoring TSVs)...', flush=True)
 
-        if config.dataset == 'SZ2':
-            # ------------------------------------------------------------------
-            # Build list of training recordings
-            # ------------------------------------------------------------------
-            train_pats_list = pd.read_csv(
-                os.path.join('net', 'datasets', 'SZ2_training.tsv'),
-                sep='\t',
-                header=None,
-                skiprows=[0, 1, 2]
-            )
-            train_pats_list = train_pats_list[0].to_list()
+            # Discover all subjects that look like "sub-XXX" and have an EEG folder
+            all_subs = []
+            for d in sorted(os.listdir(config.data_path)):
+                if not d.startswith("sub-"):
+                    continue
+                eeg_dir = os.path.join(config.data_path, d, "ses-01", "eeg")
+                if os.path.isdir(eeg_dir):
+                    all_subs.append(d)
 
+            if not all_subs:
+                print('[train][ERROR] No usable subjects found in data_path; aborting.')
+                return
+
+            n_total = len(all_subs)
+            print(f'[train] Found {n_total} subjects with EEG data: {all_subs}')
+
+            # Simple deterministic split: 70% train, 15% val, 15% test
+            n_train = max(1, int(0.7 * n_total))
+            n_val   = max(1, int(0.15 * n_total))
+            if n_train + n_val >= n_total:
+                # Ensure at least one test subject if possible
+                n_val = max(1, n_total - n_train - 1)
+
+            train_pats_list = all_subs[:n_train]
+            val_pats_list   = all_subs[n_train:n_train + n_val]
+            test_pats_list  = all_subs[n_train + n_val:]
+
+            print(f'[train] Train subjects ({len(train_pats_list)}): {train_pats_list}')
+            print(f'[train] Val subjects   ({len(val_pats_list)}): {val_pats_list}')
+            print(f'[train] Test subjects  ({len(test_pats_list)}): {test_pats_list}')
+
+            # Persist this split so predict() can reuse it later
+            split_path = os.path.join("net", "datasets", "SZ2_subject_split_auto.pkl")
+            try:
+                with open(split_path, "wb") as f:
+                    pickle.dump(
+                        {
+                            "train": train_pats_list,
+                            "val": val_pats_list,
+                            "test": test_pats_list,
+                        },
+                        f,
+                        pickle.HIGHEST_PROTOCOL,
+                    )
+                print(f"[train] Saved automatic subject split to {split_path}")
+            except Exception as e:
+                print(f"[train][WARNING] Could not save subject split pickle: {e}")
+
+
+            # Build list of training recordings, all runs for train subjects
+            print('[train] Building train_recs_list from EDF files...')
             train_recs_list = [
-                [s, r.split('_')[-2]]
+                [s, r.split("_")[-2]]
                 for s in train_pats_list
-                for r in os.listdir(os.path.join(config.data_path, s, 'ses-01', 'eeg'))
+                for r in os.listdir(os.path.join(config.data_path, s, "ses-01", "eeg"))
                 if 'edf' in r
             ]
 
-            # Names/paths for generator pickles
+            print(f'[train] Total training recordings: {len(train_recs_list)}')
+
+            # Names/paths for generator metadata (segments) and generator pickles
             gen_name = f"{config.dataset}_frame-{config.frame}_sampletype-{config.sample_type}"
+            generators_dir = os.path.join('net', 'generators')
+            os.makedirs(generators_dir, exist_ok=True)
 
-            meta_train_path = os.path.join('net', 'generators', f"meta_train_{gen_name}.pkl")
-            meta_val_path   = os.path.join('net', 'generators', f"meta_val_{gen_name}.pkl")
+            meta_train_path = os.path.join(generators_dir, f"meta_train_{gen_name}.pkl")
+            meta_val_path   = os.path.join(generators_dir, f"meta_val_{gen_name}.pkl")
+            gen_train_path  = os.path.join(generators_dir, f"gen_train_{gen_name}.pkl")
+            gen_val_path    = os.path.join(generators_dir, f"gen_val_{gen_name}.pkl")
 
-            gen_train_path  = os.path.join('net', 'generators', f"gen_train_{gen_name}.pkl")
-            gen_val_path    = os.path.join('net', 'generators', f"gen_val_{gen_name}.pkl")
+            # We optionally reuse cached segment metadata (recs_list + segments)
+            # to avoid recomputing keys; generators themselves can also be cached.
+            train_segments = None
+            val_segments = None
+            val_recs_list = None
 
-            gen_train = None
-            gen_val = None
+            # Try to reuse cached segment metadata if it exists and is well-formed
+            meta_train = None
+            meta_val = None
+            if os.path.exists(meta_train_path) and os.path.exists(meta_val_path):
+                try:
+                    with open(meta_train_path, 'rb') as f:
+                        meta_train = pickle.load(f)
+                    with open(meta_val_path, 'rb') as f:
+                        meta_val = pickle.load(f)
 
-            # ------------------------------------------------------------------
-            # OPTION 1: Load existing generator metadata / generator objects
-            # ------------------------------------------------------------------
-            if load_generators:
-                print('Loading generator metadata...')
+                    if (
+                        isinstance(meta_train, dict)
+                        and isinstance(meta_val, dict)
+                        and 'recs_list' in meta_train
+                        and 'segments' in meta_train
+                        and 'recs_list' in meta_val
+                        and 'segments' in meta_val
+                    ):
+                        # Reuse cached segment keys
+                        train_recs_list = meta_train['recs_list']
+                        train_segments = meta_train['segments']
 
-                used_source = None
+                        val_recs_list = meta_val['recs_list']
+                        val_segments = meta_val['segments']
+                        print(f'Loaded cached segment metadata from meta_* pickles for {gen_name}.')
+                    else:
+                        print('Cached meta_* pickles are not in the expected format – ignoring cache.')
+                        meta_train = None
+                        meta_val = None
+                except Exception as e:
+                    print(f'Error loading meta_* pickles ({e}) – regenerating segment metadata from raw data.')
+                    meta_train = None
+                    meta_val = None
 
-                # Prefer new-style meta_* pickles
-                if os.path.exists(meta_train_path) and os.path.exists(meta_val_path):
-                    try:
-                        with open(meta_train_path, 'rb') as f:
-                            meta_train = pickle.load(f)
-                        with open(meta_val_path, 'rb') as f:
-                            meta_val = pickle.load(f)
-
-                        # Case A: proper metadata dicts
-                        if (
-                            isinstance(meta_train, dict)
-                            and isinstance(meta_val, dict)
-                            and "recs_list" in meta_train
-                            and "segments" in meta_train
-                            and "recs_list" in meta_val
-                            and "segments" in meta_val
-                        ):
-                            train_recs_list = meta_train["recs_list"]
-                            train_segments  = meta_train["segments"]
-
-                            val_recs_list = meta_val["recs_list"]
-                            val_segments  = meta_val["segments"]
-
-                            gen_train = SegmentedGenerator(
-                                config,
-                                train_recs_list,
-                                train_segments,
-                                batch_size=config.batch_size,
-                                shuffle=True
-                            )
-                            gen_val = SequentialGenerator(
-                                config,
-                                val_recs_list,
-                                val_segments,
-                                batch_size=600,
-                                shuffle=False
-                            )
-                            used_source = "meta"
-                            print(f"Loaded generator metadata from meta_* pickles for {gen_name}.")
-
-                        # Case B: meta_* actually contain full generator objects
-                        elif (
-                            isinstance(meta_train, SegmentedGenerator)
-                            and isinstance(meta_val, SequentialGenerator)
-                        ):
-                            gen_train = meta_train
-                            gen_val = meta_val
-                            used_source = "meta_generators"
-                            print(f"Loaded generator objects stored inside meta_* pickles for {gen_name}.")
-
-                        else:
-                            print(
-                                "meta_train/meta_val are not in the expected format. "
-                                f"Types are: train={type(meta_train)}, val={type(meta_val)}. "
-                                "Will try gen_* pickles."
-                            )
-
-                    except Exception as e:
-                        print(f"Error loading meta_* pickles: {e}")
-                        print("Will try gen_* pickles next.")
-
-                # Fallback: old-style gen_* pickles (full generator objects)
-                if used_source is None and os.path.exists(gen_train_path) and os.path.exists(gen_val_path):
-                    try:
-                        with open(gen_train_path, 'rb') as f:
-                            gen_train = pickle.load(f)
-                        with open(gen_val_path, 'rb') as f:
-                            gen_val = pickle.load(f)
-                        used_source = "gen"
-                        print(f"Loaded generator objects from gen_* pickles for {gen_name}.")
-                    except Exception as e:
-                        print(f"Error loading gen_* pickles: {e}")
-
-                # If neither worked, fall back to regenerating
-                if used_source is None or gen_train is None or gen_val is None:
-                    print("No valid generator pickles found or they could not be loaded. Regenerating from raw data.")
-                    load_generators = False
-
-            # ------------------------------------------------------------------
-            # OPTION 2: Generate generators from raw data (and optionally save)
-            # ------------------------------------------------------------------
-            if not load_generators:
-                # Training segments
+            # If no valid cached metadata, (re)generate segment keys from raw data
+            if train_segments is None or val_segments is None or val_recs_list is None:
+                print('Generating training segments from raw data...')
                 if config.sample_type == 'subsample':
                     train_segments = generate_data_keys_subsample(config, train_recs_list)
                 else:
                     train_segments = generate_data_keys_sequential(config, train_recs_list)
 
-                print('Generating training segments...')
-                gen_train = SegmentedGenerator(
-                    config,
-                    train_recs_list,
-                    train_segments,
-                    batch_size=config.batch_size,
-                    shuffle=True
-                )
-
-                # Validation recordings
-                val_pats_list = pd.read_csv(
-                    os.path.join('net', 'datasets', 'SZ2_validation.tsv'),
-                    sep='\t',
-                    header=None,
-                    skiprows=[0, 1, 2]
-                )
-                val_pats_list = val_pats_list[0].to_list()
+                print('Building validation recording list from automatic subject split...')
+                # val_pats_list was already computed above from all_subs
                 val_recs_list = [
                     [s, r.split('_')[-2]]
                     for s in val_pats_list
@@ -213,43 +326,126 @@ def train(config, load_generators, save_generators):
                     if 'edf' in r
                 ]
 
-                # 5-minute sequential windows
-                val_segments = generate_data_keys_sequential_window(config, val_recs_list, 5 * 60)
+                # Use the same window style as training for validation
+                print('Generating validation segments from raw data...')
+                if config.sample_type == 'subsample':
+                    val_segments = generate_data_keys_subsample(config, val_recs_list)
+                else:
+                    val_segments = generate_data_keys_sequential(config, val_recs_list)
 
-                print('Generating validation segments...')
-                gen_val = SequentialGenerator(
-                    config,
-                    val_recs_list,
-                    val_segments,
-                    batch_size=600,
-                    shuffle=False
-                )
-
-                if save_generators:
-                    print("Saving generator metadata and generator objects...")
-
-                    if not os.path.exists('net/generators'):
-                        os.mkdir('net/generators')
-
-                    # Save lightweight metadata
+                    print('Saving segment metadata (meta_train_*, meta_val_*) for future runs...')
                     meta_train = {"recs_list": train_recs_list, "segments": train_segments}
                     meta_val   = {"recs_list": val_recs_list, "segments": val_segments}
-
-                    with open(meta_train_path, "wb") as f:
+                    with open(meta_train_path, 'wb') as f:
                         pickle.dump(meta_train, f, pickle.HIGHEST_PROTOCOL)
-                    with open(meta_val_path, "wb") as f:
+                    with open(meta_val_path, 'wb') as f:
                         pickle.dump(meta_val, f, pickle.HIGHEST_PROTOCOL)
+                    # Invalidate any stale generator pickles since segments changed
+                    for p in [gen_train_path, gen_val_path]:
+                        if os.path.exists(p):
+                            os.remove(p)
 
-                    # Also save full generator objects (backward compatibility)
-                    with open(gen_train_path, "wb") as f:
+            # Enforce binary labeling: 0=non-pre-ictal, 1=pre-ictal
+            # (ictal segments are collapsed into class 0)
+            train_segments = remap_labels_to_binary_preictal(train_segments)
+            val_segments   = remap_labels_to_binary_preictal(val_segments)
+
+            # Auto-check label distribution and (optionally) oversample pre-ictal (class 1)
+            # if it is severely under-represented compared to interictal (class 0).
+            # Currently oversampling is disabled (line left commented out).
+            try:
+                labels = np.array([int(seg[3]) for seg in train_segments])
+                unique, counts = np.unique(labels, return_counts=True)
+                print('Training label distribution before oversampling '
+                      '(0=interictal,1=seizure/pre-ictal):')
+                for u, c in zip(unique, counts):
+                    print(f'  class {u}: {c} samples')
+
+                n0 = counts[unique == 0][0] if np.any(unique == 0) else 0
+                n1 = counts[unique == 1][0] if np.any(unique == 1) else 0
+
+                # Target: roughly 30% as many pre-ictal as interictal samples,
+                # with a maximum duplication factor of 5x to avoid extremes.
+                if n0 > 0 and n1 > 0:
+                    target_n1 = 0.3 * n0
+                    if n1 < target_n1:
+                        factor = int(np.clip(np.ceil(target_n1 / n1), 2, 5))
+                        pre_segments = [s for s in train_segments if int(s[3]) == 1]
+                        print(
+                            f'Auto-oversampling pre-ictal (class 1) by factor {factor} '
+                            f'(original n1={n1}, target≈{int(target_n1)})'
+                        )
+                        # To enable oversampling, uncomment the next line:
+                        # train_segments = train_segments + pre_segments * (factor - 1)
+
+                        # Recompute and print distribution after oversampling (currently unchanged)
+                        labels = np.array([int(seg[3]) for seg in train_segments])
+                        unique, counts = np.unique(labels, return_counts=True)
+                        print('Training label distribution after oversampling (effective):')
+                        for u, c in zip(unique, counts):
+                            print(f'class {u}: {c} samples')
+                    else:
+                        print('Pre-ictal class proportion is acceptable; no oversampling applied.')
+                else:
+                    print('Not enough labeled data to compute class 0/1 distribution; '
+                          'skipping auto-oversampling.')
+            except Exception as e:
+                print(f'[Warning] Could not auto-oversample pre-ictal segments: {e}')
+
+            # Instantiate or load training generator
+            if load_generators and os.path.exists(gen_train_path):
+                print('Loading cached training generator from', gen_train_path)
+                with open(gen_train_path, 'rb') as f:
+                    gen_train = pickle.load(f)
+            else:
+                print('Instantiating training generator...')
+                gen_train = SegmentedGenerator(config, train_recs_list, train_segments, batch_size = config.batch_size, shuffle = True,)
+                if save_generators:
+                    print('Saving training generator cache to', gen_train_path)
+                    with open(gen_train_path, 'wb') as f:
                         pickle.dump(gen_train, f, pickle.HIGHEST_PROTOCOL)
-                    with open(gen_val_path, "wb") as f:
+
+            # Debug: inspect the label distribution over the entire training generator
+            try:
+                print('Checking training label distribution...')
+                # Use max_batches to limit runtime if desired (e.g., 5); None = all batches
+                check_train_labels(gen_train, seizure_class_idx=1, max_batches=5)
+            except Exception as e:
+                print(f'[Warning] Could not check training labels: {e}')
+
+            # Instantiate or load validation generator
+            if load_generators and os.path.exists(gen_val_path):
+                print('Loading cached validation generator from', gen_val_path)
+                with open(gen_val_path, 'rb') as f:
+                    gen_val = pickle.load(f)
+            else:
+                print('Instantiating validation generator...')
+                gen_val = SequentialGenerator(config, val_recs_list, val_segments, batch_size = 600, shuffle = False,)
+                if save_generators:
+                    print('Saving validation generator cache to', gen_val_path)
+                    with open(gen_val_path, 'wb') as f:
                         pickle.dump(gen_val, f, pickle.HIGHEST_PROTOCOL)
 
-            # ------------------------------------------------------------------
-            # Train the model using the prepared generators
-            # ------------------------------------------------------------------
-            print('### Training model....')
+            # Debug: check that validation labels actually contain seizures
+            try:
+                print('Checking validation label distribution...')
+                check_val_labels(gen_val, seizure_class_idx = 1, max_batches = None)
+            except Exception as e:
+                print(f'[Warning] Could not check validation labels: {e}')
+
+            # Optional: plot EEG with event boundaries and 30s pre-ictal window
+            try:
+                ictal_rec_idxs = sorted({int(seg[0]) for seg in val_segments if int(seg[3]) == 2})
+                if ictal_rec_idxs:
+                    target_rec_idx = ictal_rec_idxs[0]
+                    plot_eeg_with_events_and_preictal(config, val_recs_list, val_segments, target_rec_idx, pre_len = 30.0,)
+                else:
+                    print('No ictal segments found in validation set - skipping EEG/pre-ictal plot.')
+            except Exception as e:
+                print(f'Could not generate EEG/pre-ictal plot: {e}')
+
+            # Build ChronoNet model
+            print('Training model....')
             model = net(config)
 
             start_train = time.time()
@@ -257,14 +453,13 @@ def train(config, load_generators, save_generators):
             end_train = time.time() - start_train
             print('Total train duration = ', end_train / 60)
 
-    #######################################################################################################################
-    #######################################################################################################################
 
-
-def predict(config):
-
+def predict(config): 
+    # Predict routine
+    print('[predict] Entering predict()')
+    # Select model (ChronoNet ONLY)
     name = config.get_name()
-
+    # Force config.model to ChronoNet for consistency
     model_save_path = os.path.join(config.save_dir, 'models', name)
 
     # Ensure prediction directories
@@ -274,16 +469,30 @@ def predict(config):
     if not os.path.exists(pred_path):
         os.mkdir(pred_path)
 
-    # ------------------------------------------------------------
-    # Build test subject/record list from SZ2_*_test.tsv
-    # ------------------------------------------------------------
-    test_pats_list = pd.read_csv(
-        os.path.join('net', 'datasets', config.dataset + '_test.tsv'),
-        sep='\t',
-        header=None,
-        skiprows=[0, 1, 2]
-    )
-    test_pats_list = test_pats_list[0].to_list()
+    # Build test subject/record list
+    # Prefer the automatic subject split created during training;
+    # fall back to SZ2_test.tsv only if needed.
+    split_path = os.path.join("net", "datasets", "SZ2_subject_split_auto.pkl")
+    test_pats_list = None
+
+    if os.path.exists(split_path):
+        try:
+            with open(split_path, "rb") as f:
+                split = pickle.load(f)
+            if isinstance(split, dict) and 'test' in split:
+                test_pats_list = split['test']
+                print(f'[predict] Loaded test subjects from {split_path}: {test_pats_list}')
+        except Exception as e:
+            print(f'[predict][WARNING] Could not load subject split pickle ({e}); falling back to TSV.')
+
+    if test_pats_list is None:
+        print('[predict] Falling back to SZ2_test.tsv for test subject list...')
+        test_pats_list = pd.read_csv(
+            os.path.join("net", "datasets", config.dataset + "_test.tsv"),
+            sep="\t",
+            header=None,
+            skiprows=[0, 1, 2],
+        )[0].to_list()
     test_recs_list = [
         [s, r.split('_')[-2]]
         for s in test_pats_list
@@ -291,9 +500,7 @@ def predict(config):
         if 'edf' in r
     ]
 
-    # ------------------------------------------------------------
     # Build & cache ONE BIG test generator (meta_test_*, gen_test_*)
-    # ------------------------------------------------------------
     gen_name = f"{config.dataset}_frame-{config.frame}_sampletype-{config.sample_type}"
     generators_dir = os.path.join("net", "generators")
     os.makedirs(generators_dir, exist_ok=True)
@@ -302,14 +509,15 @@ def predict(config):
     gen_test_path  = os.path.join(generators_dir, f"gen_test_{gen_name}.pkl")
 
     if os.path.exists(meta_test_path) and os.path.exists(gen_test_path):
-        print("Using existing meta_test / gen_test pickles for test set...")
+        print('Using existing meta_test / gen_test pickles for test set...')
         with open(meta_test_path, "rb") as f:
             meta_test = pickle.load(f)
-        # We still rebuild the generator to be robust to code changes
-        test_recs_list = meta_test["recs_list"]
-        test_segments = meta_test["segments"]
+        with open(gen_test_path, "rb") as f:
+            gen_test_all = pickle.load(f)
+        test_recs_list = meta_test['recs_list']
+        test_segments = meta_test['segments']
     else:
-        print("Creating and caching test generators (meta_test / gen_test)...")
+        print('Creating and caching test generators (meta_test / gen_test)...')
 
         # One call builds segments for *all* test recordings
         test_segments = generate_data_keys_sequential(
@@ -317,12 +525,34 @@ def predict(config):
         )
 
         # Lightweight metadata
-        meta_test = {"recs_list": test_recs_list, "segments": test_segments}
+        meta_test = {'recs_list': test_recs_list, 'segments': test_segments}
         with open(meta_test_path, "wb") as f:
             pickle.dump(meta_test, f, pickle.HIGHEST_PROTOCOL)
 
-        # Also cache a full generator object (mainly for debugging/backwards compatibility)
-        gen_test_all_tmp = SequentialGenerator(
+        # Also cache a full generator object
+        gen_test_all = SequentialGenerator(config, test_recs_list, test_segments, batch_size = 600, shuffle = False, verbose = False,)
+        with open(gen_test_path, "wb") as f:
+            pickle.dump(gen_test_all, f, pickle.HIGHEST_PROTOCOL)
+
+    # Safety checks
+    if meta_test is None:
+        print('No meta_test information found - skipping prediction.')
+        return
+
+    test_recs_list = meta_test['recs_list']
+    test_segments = meta_test['segments']
+    # Enforce binary labeling (0=non-pre-ictal,1=pre-ictal) for test set
+    test_segments = remap_labels_to_binary_preictal(test_segments)
+    meta_test['segments'] = test_segments
+
+    if len(test_segments) == 0:
+        print('No test segments found - skipping prediction.')
+        return
+
+    if gen_test_all is None:
+        # Rebuild generator from metadata if pickle missing or corrupted
+        print("Test generator pickle missing or invalid - rebuilding SequentialGenerator...")
+        gen_test_all = SequentialGenerator(
             config,
             test_recs_list,
             test_segments,
@@ -330,35 +560,12 @@ def predict(config):
             shuffle=False,
             verbose=False,
         )
-        with open(gen_test_path, "wb") as f:
-            pickle.dump(gen_test_all_tmp, f, pickle.HIGHEST_PROTOCOL)
-        del gen_test_all_tmp
-        gc.collect()
-
-    # Rebuild ONE big test generator from metadata
-    test_recs_list = meta_test["recs_list"]
-    test_segments = meta_test["segments"]
-
-    if len(test_segments) == 0:
-        print("No test segments found – skipping prediction.")
-        return
-
-    gen_test_all = SequentialGenerator(
-        config,
-        test_recs_list,
-        test_segments,
-        batch_size=600,
-        shuffle=False,
-        verbose=False,
-    )
 
     if len(gen_test_all) == 0:
-        print("Unified test generator is empty – skipping prediction.")
+        print('Unified test generator is empty - skipping prediction.')
         return
 
-    # ------------------------------------------------------------
     # Build model once, load weights once, predict once
-    # ------------------------------------------------------------
     model_weights_path = os.path.join(
         model_save_path, 'Weights', name + '.weights.h5'
     )
@@ -369,15 +576,9 @@ def predict(config):
         config_name=name + '.cfg',
     )
 
-    # Build same model architecture
-    if config.model == 'DeepConvNet':
-        from net.DeepConv_Net import net
-    elif config.model == 'ChronoNet':
-        from net.ChronoNet import net
-    elif config.model == 'EEGnet':
-        from net.EEGnet import net
-    else:
-        raise ValueError(f"Unknown model type: {config.model}")
+    # Build same model architecture 
+    from net.ChronoNet import net
+    config.model = 'ChronoNet'
 
     print("Running unified prediction over entire test set...")
     model = net(config)
@@ -385,20 +586,18 @@ def predict(config):
 
     # Safety check
     if y_pred_all.size == 0:
-        print("No predictions produced by unified test generator – aborting per-record save.")
+        print('No predictions produced by unified test generator - aborting per-record save.')
         return
 
-    # ------------------------------------------------------------
     # Split unified predictions back into per-record sequences
     # and save HDF5 files matching the original evaluation format.
-    # ------------------------------------------------------------
     # We assume the order of samples in y_pred_all/y_true_all matches
     # the order of `test_segments` as built above.
     num_samples = len(y_pred_all)
     if num_samples < len(test_segments):
         print(
-            f"Warning: number of predictions ({num_samples}) is smaller than "
-            f"number of segments ({len(test_segments)}). Truncating segments list."
+            f'Warning: number of predictions ({num_samples}) is smaller than '
+            f'number of segments ({len(test_segments)}). Truncating segments list.'
         )
         effective_segments = test_segments[:num_samples]
     else:
@@ -420,7 +619,7 @@ def predict(config):
         # Get indices for this recording (may be empty)
         idxs = rec_to_indices.get(rec_idx, [])
         if len(idxs) == 0:
-            print(f"No valid segments/predictions for {rec[0]} {rec[1]} – skipping file.")
+            print(f'No valid segments/predictions for {rec[0]} {rec[1]} – skipping file.')
             continue
 
         y_pred_rec = y_pred_all[idxs]
@@ -432,21 +631,10 @@ def predict(config):
 
     gc.collect()
 
-#######################################################################################################################
-#######################################################################################################################
-
 
 def evaluate(config):
 
-    """
-    Evaluation for 3-class model (0=interictal, 1=pre-ictal, 2=ictal),
-    but metrics focus ONLY on pre-ictal detection (class 1):
-
-    - Sensitivity_preictal
-    - False alarms per hour (FA/h) on interictal segments
-
-    Ictal (class 2) samples are ignored in the metric computation.
-    """
+    print('[evaluate] Entering evaluate()')
 
     name = config.get_name()
 
@@ -472,12 +660,29 @@ def evaluate(config):
     sens_ovlp_plot = []
     prec_ovlp_plot = []
 
-    pred_files = sorted(os.listdir(pred_path))
+    pred_files = sorted(f for f in os.listdir(pred_path) if f.endswith('.h5'))
+
+    # Global confusion matrix accumulators at threshold 0.2 (index 25)
+    TP_global = 0
+    FP_global = 0
+    TN_global = 0
+    FN_global = 0
 
     for file in tqdm(pred_files):
         with h5py.File(os.path.join(pred_path, file), 'r') as f:
             y_pred = np.array(f['y_pred'])
             y_true = np.array(f['y_true'])
+            # Skip files with completely empty predictions/labels to avoid
+            # downstream shape issues or stalling on RMSA computation.
+            if y_pred.size == 0 or y_true.size == 0:
+                print(f'[Warning] Empty y_pred or y_true in {file} – skipping from evaluation.')
+                sens_preictal_all.append([np.nan] * len(thresholds))
+                fa_per_hour_all.append([np.nan] * len(thresholds))
+                spec_interictal_all.append([np.nan] * len(thresholds))
+                score_all.append([np.nan] * len(thresholds))
+                sens_ovlp_plot.append(np.full_like(x_plot, np.nan, dtype=float))
+                prec_ovlp_plot.append(np.full_like(x_plot, np.nan, dtype=float))
+                continue
 
         # Convert y_true to class indices (0,1,2)
         if y_true.ndim == 2 and y_true.shape[1] > 1:
@@ -490,13 +695,22 @@ def evaluate(config):
             # Degenerate case: treat as probabilities for pre-ictal only
             y_pred = y_pred.reshape(-1, 1)
 
-        # ------------------------------------------------------------------
         # Apply RMSA-based artifact mask (as in original code) to y_pred
-        # ------------------------------------------------------------------
         rec = [file.split('_')[0], file.split('_')[1]]
         rec_data = Data.loadData(config.data_path, rec, modalities=['eeg'])
 
-        [ch_focal, ch_cross] = apply_preprocess_eeg(config, rec_data)
+        # Gracefully skip empty Data objects (missing EEG file) instead of raising
+        try:
+            [ch_focal, ch_cross] = apply_preprocess_eeg(config, rec_data)
+        except ValueError:
+            # Append NaN arrays to keep positional alignment
+            sens_preictal_all.append([np.nan]*len(thresholds))
+            fa_per_hour_all.append([np.nan]*len(thresholds))
+            spec_interictal_all.append([np.nan]*len(thresholds))
+            score_all.append([np.nan]*len(thresholds))
+            sens_ovlp_plot.append(np.full_like(x_plot, np.nan, dtype=float))
+            prec_ovlp_plot.append(np.full_like(x_plot, np.nan, dtype=float))
+            continue
 
         rmsa_f = [
             np.sqrt(np.mean(ch_focal[start:start + 2 * config.fs] ** 2))
@@ -526,18 +740,14 @@ def evaluate(config):
         else:
             y_pred[mask_bad] = 0.0
 
-        # ------------------------------------------------------------------
         # Extract pre-ictal probability (class index 1)
-        # ------------------------------------------------------------------
         if y_pred.ndim == 2 and y_pred.shape[1] >= 2:
             p_pre = y_pred[:, 1]
         else:
             # Fallback if shape unexpected
             p_pre = y_pred.astype(float).flatten()
 
-        # ------------------------------------------------------------------
         # Compute metrics for each threshold
-        # ------------------------------------------------------------------
         sens_preictal_th = []
         fa_per_hour_th = []
         spec_interictal_th = []
@@ -547,10 +757,9 @@ def evaluate(config):
             # Binary decision: pre-ictal vs non-pre-ictal
             pred_bin = (p_pre >= th).astype(int)  # 1 = predicted pre-ictal
 
-            # Ignore ictal (class 2) samples in the metrics
-            mask_eval = (y_true_cls != 2)
-            yt = y_true_cls[mask_eval]
-            yp = pred_bin[mask_eval]
+            # All samples are either 0 (non-pre-ictal) or 1 (pre-ictal)
+            yt = y_true_cls
+            yp = pred_bin
 
             if yt.size == 0:
                 sens_preictal_th.append(np.nan)
@@ -591,6 +800,14 @@ def evaluate(config):
             else:
                 score_th.append(np.nan)
 
+            # Aggregate confusion matrix counts for threshold ~0.2
+            if th == 0.2:
+                TP_global += TP
+                FP_global += FP
+                TN_global += TN
+                FN_global += FN
+
+        # After computing all thresholds for this recording, append metric lists once
         sens_preictal_all.append(sens_preictal_th)
         fa_per_hour_all.append(fa_per_hour_th)
         spec_interictal_all.append(spec_interictal_th)
@@ -625,12 +842,12 @@ def evaluate(config):
         # No precision-based curve here; just reuse sensitivity curve as a placeholder
         prec_ovlp_plot.append(y_plot.copy())
 
-    # Report score at threshold index 25 (approx th = 0.5)
+    # Report score at threshold index 25 (approx th = 0.2)
     score_05 = [x[25] for x in score_all if len(x) > 25]
     if len(score_05) > 0:
-        print('Score (pre-ictal, th=0.5): ' + "%.2f" % np.nanmean(score_05))
+        print('Score (pre-ictal, th=0.2): ' + '%.2f' % np.nanmean(score_05))
     else:
-        print('Score (pre-ictal, th=0.5): NaN')
+        print('Score (pre-ictal, th=0.2): NaN')
 
     # Save metrics
     with h5py.File(result_file, 'w') as f:
@@ -645,15 +862,79 @@ def evaluate(config):
         f.create_dataset('prec_ovlp_plot', data=prec_ovlp_plot)
         f.create_dataset('x_plot', data=x_plot)
 
+        # Confusion matrix at threshold 0.2
+        cm = np.array([[TP_global, FP_global], [FN_global, TN_global]])
+        f.create_dataset('confusion_matrix_th02', data=cm)
 
-#######################################################################################################################
-#######################################################################################################################
+    # Print confusion matrix & derived metrics
+    if TP_global + FP_global + TN_global + FN_global > 0:
+        precision = TP_global / (TP_global + FP_global) if (TP_global + FP_global) > 0 else float('nan')
+        recall = TP_global / (TP_global + FN_global) if (TP_global + FN_global) > 0 else float('nan')
+        specificity = TN_global / (TN_global + FP_global) if (TN_global + FP_global) > 0 else float('nan')
+        f1 = (2 * precision * recall / (precision + recall)
+              if precision + recall > 0 else float('nan'))
+        print('\nConfusion matrix (threshold=0.2, binary event-related vs inter-ictal):')
+        print('Pred Pre  Pred Non')
+        print(f'True Pre:   {TP_global:5d}    {FN_global:5d}')
+        print(f'True Non:   {FP_global:5d}    {TN_global:5d}')
+        print(f'Precision: {precision:.4f}')
+        print(f'Recall: {recall:.4f}')
+        print(f'Specificity: {specificity:.4f}')
+        print(f'F1: {f1:.4f}')
+
+    # Plot training curves (loss, accuracy, AUC) if history CSV exists
+    try:
+        import pandas as pd
+        import matplotlib
+        matplotlib.use('Agg')  # headless
+        import matplotlib.pyplot as plt
+
+        history_csv = os.path.join(config.save_dir, 'models', name, 'History', name + '.csv')
+        if os.path.exists(history_csv):
+            df = pd.read_csv(history_csv)
+            curves_dir = os.path.join(config.save_dir, 'results')
+            # Loss plot
+            plt.figure(figsize=(10,5))
+            if 'loss' in df.columns and 'val_loss' in df.columns:
+                plt.plot(df['loss'], label='Train Loss')
+                plt.plot(df['val_loss'], label='Val Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title('Loss Curve')
+            plt.legend(); plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(curves_dir, 'loss_curve.png'), dpi=150)
+            plt.close()
+
+            # Accuracy plot
+            if 'accuracy' in df.columns and 'val_accuracy' in df.columns:
+                plt.figure(figsize=(10,5))
+                plt.plot(df['accuracy'], label='Train Acc')
+                plt.plot(df['val_accuracy'], label='Val Acc')
+                plt.xlabel('Epoch'); plt.ylabel('Accuracy'); plt.title('Accuracy Curve')
+                plt.legend(); plt.grid(True); plt.tight_layout()
+                plt.savefig(os.path.join(curves_dir, 'accuracy_curve.png'), dpi=150)
+                plt.close()
+
+            # AUC plot
+            if 'auc' in df.columns and 'val_auc' in df.columns:
+                plt.figure(figsize=(10,5))
+                plt.plot(df['auc'], label='Train AUC')
+                plt.plot(df['val_auc'], label='Val AUC')
+                plt.xlabel('Epoch'); plt.ylabel('AUC'); plt.title('AUC Curve')
+                plt.legend(); plt.grid(True); plt.tight_layout()
+                plt.savefig(os.path.join(curves_dir, 'auc_curve.png'), dpi=150)
+                plt.close()
+            print('Saved training curves (loss_curve.png, accuracy_curve.png, auc_curve.png) to results directory.')
+        else:
+            print('History CSV not found; skipping curve plotting.')
+    except Exception as e:
+        print(f'Could not plot training curves: {e}')
+
 
 
 def main():
-    """
-    Entry point: set seeds, build Config, and run train -> predict -> evaluate.
-    """
+    print('[main_net] Entering main()')
     import random
 
     # Reproducibility
@@ -670,8 +951,13 @@ def main():
     from net import key_generator
     key_generator.random.seed(random_seed)
 
-    # Import configuration class
-    from net.DL_config import Config
+    # Import configuration class (robust to different class names in DL_config)
+    from net import DL_config as dlc
+    Config = getattr(dlc, "Config", None)
+    if Config is None:
+        Config = getattr(dlc, "DL_Config", None)
+    if Config is None:
+        raise ImportError('Could not find \'Config\' or \'DL_Config\' in net.DL_config')
 
     # GPU setup
     physical_gpus = tf.config.list_physical_devices('GPU')
@@ -682,46 +968,80 @@ def main():
     else:
         print('Running on CPU.')
 
-    ###########################################
-    ## Initialize standard config parameters ##
-    ###########################################
+    # Select experiment profile and basic overrides
+    parser = argparse.ArgumentParser(description='Seizure detection experiments')
+    parser.add_argument('--exp', choices=['eeg', 'eeg_hrv', 'hrv'], default='eeg',
+                        help='Which experiment profile to run')
+    parser.add_argument('--data-path', default='/Users/rosalouisemarker/Desktop/Digital Media Project/dataset',
+                        help='Path to SZ2 BIDS root')
+    parser.add_argument('--save-dir', default='net/save_dir',
+                        help='Base directory for saving models/results')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override batch size')
 
+    args = parser.parse_args()
+
+
+    # Initialize standard config parameters 
     config = Config()
-    config.data_path = '/Users/rosalouisemarker/Desktop/Digital Media Project/dataset'  # path to data
-    config.save_dir = 'net/save_dir'                                                   # save directory for outputs
+    # Basic paths from CLI
+    config.data_path = args.data_path
+    config.save_dir = args.save_dir
     if not os.path.exists(config.save_dir):
         os.mkdir(config.save_dir)
 
-    config.fs = 250              # Sampling frequency after post-processing
-    config.CH = 2                # Nr of EEG channels
+    # Restrict to EEG + ECG data only
+    config.modalities = ['eeg', 'ecg']
+
+    # Use EEG+HRV input mode by default
+    config.input_mode = 'eeg_hrv'
+
+    # Core data/segmentation parameters
+    config.fs = 250              
+    config.CH = 2               
     config.cross_validation = 'fixed'
-    config.batch_size = 128
-    config.frame = 2             # window size (seconds)
-    config.stride = 1            # stride (background EEG, seconds)
-    config.stride_s = 0.5        # stride (seizure EEG, seconds)
-    config.boundary = 0.5        # proportion of seizure data to mark positive
-    config.factor = 5            # class balancing factor
+    config.batch_size = args.batch_size if args.batch_size is not None else 128
+    config.frame = 2            
+    config.stride = 1           
+    config.stride_s = 0.5     
+    config.boundary = 0.5      
+    config.factor = 5           
 
     # Network hyper-parameters
     config.dropoutRate = 0.5
-    config.nb_epochs = 80
+    config.nb_epochs = 5
     config.l2 = 0.01
-    config.lr = 0.01
+    config.lr = 0.001  
 
-    ###########################################
-    #####q INPUT CONFIGS:
-    ###########################################
-    config.model = 'ChronoNet'          # model architecture
-    config.dataset = 'SZ2'              # dataset split (see datasets folder)
-    config.sample_type = 'subsample'    # subsample background EEG
-    config.add_to_name = 'test'         # suffix for experiment name
+    # Input / experiment configs
+    config.model = 'ChronoNet'       
+    config.dataset = 'SZ2'            
+    config.sample_type = 'sequential'  
 
-    ###########################################
-    ###########################################
+    if hasattr(config, 'apply_experiment_profile'):
+        config.apply_experiment_profile(args.exp)
+    else:
+        # Fallback: configure input_mode directly based on --exp
+        if args.exp == 'eeg':
+            config.input_mode = 'eeg'
+        elif args.exp == 'eeg_hrv':
+            config.input_mode = 'eeg_hrv'  # EEG + HRV combined or multi-branch
+        elif args.exp == 'hrv':
+            config.input_mode = 'hrv'      # HRV-only model
+        # Use experiment name as suffix for saving
+        config.add_to_name = args.exp
 
+    print(f'Running experiment: {args.exp} (input_mode={getattr(config, "input_mode", "eeg")})')
+    print(f'Data path: {config.data_path}')
+    print(f'Save dir : {config.save_dir}')
+
+    # Train the model
     print('Training the model...')
-    load_generators = True   # load generators from pkl if available
-    save_generators = False  # do not resave generators in this run
+    # Enable caching of generators by default:
+    load_generators = False    
+    save_generators = True   
 
     train(config, load_generators, save_generators)
 

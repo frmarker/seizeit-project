@@ -21,19 +21,9 @@ from net.utils import apply_preprocess_eeg, get_metrics_scoring
 from classes.data import Data
 
 
-# -------------------------------------------------------
-# Relabel segments: 3 classes (0 = interictal, 1 = pre-ictal, 2 = ictal)
-# -------------------------------------------------------
-def relabel_segments_to_threeclass(segments, pre_len=30.0):
-    """
-    Convert seizure labels (1 = ictal, 0 = non-seizure) into:
-        0 = interictal
-        1 = pre-ictal (pre_len seconds before ictal onset)
-        2 = ictal
 
-    segments: list of [rec_idx, start_s, stop_s, label]
-    pre_len: pre-ictal window length in seconds
-    """
+def relabel_segments_to_threeclass(segments, pre_len=30.0):
+
     segs = [list(s) for s in segments]
     by_rec = {}
 
@@ -86,93 +76,87 @@ def relabel_segments_to_threeclass(segments, pre_len=30.0):
     return new_segments
 
 
-# -------------------------------------------------------
-# TRAIN
-# -------------------------------------------------------
+
 def train(config, load_generators: bool, save_generators: bool):
-    """
-    Main training routine.
-    """
+ 
     name = config.get_name()
 
-    if config.model == "ChronoNet":
+    if config.model == 'ChronoNet':
         from net.ChronoNet import net
-    elif config.model == "EEGnet":
+    elif config.model == 'EEGnet':
         from net.EEGnet import net
-    elif config.model == "DeepConvNet":
+    elif config.model == 'DeepConvNet':
         from net.DeepConv_Net import net
     else:
-        raise ValueError(f"Unknown model: {config.model}")
+        raise ValueError(f'Unknown model: {config.model}')
 
-    models_root = os.path.join(config.save_dir, "models")
+    models_root = os.path.join(config.save_dir, 'models')
     os.makedirs(models_root, exist_ok=True)
 
     model_save_path = os.path.join(models_root, name)
     os.makedirs(model_save_path, exist_ok=True)
 
-    config_path = os.path.join(model_save_path, "configs")
+    config_path = os.path.join(model_save_path, 'configs')
     os.makedirs(config_path, exist_ok=True)
 
     config.save_config(save_path=config_path)
 
-    # We keep your "fixed" split behaviour, but 3-class relabel.
-    if config.cross_validation == "fixed" and config.dataset == "SZ2":
-        # --- training subjects ---
+
+    if config.cross_validation == 'fixed' and config.dataset == 'SZ2':
+        # training 
         train_pats_list = pd.read_csv(
-            os.path.join("net", "datasets", "SZ2_training.tsv"),
-            sep="\t",
+            os.path.join('net', 'datasets', 'SZ2_training.tsv'),
+            sep='\t',
             header=None,
             skiprows=[0, 1, 2],
         )[0].to_list()
 
         train_recs_list = [
-            [s, r.split("_")[-2]]
+            [s, r.split('_')[-2]]
             for s in train_pats_list
-            for r in os.listdir(os.path.join(config.data_path, s, "ses-01", "eeg"))
-            if "edf" in r
+            for r in os.listdir(os.path.join(config.data_path, s, 'ses-01', 'eeg'))
+            if 'edf' in r
         ]
 
-        # --- validation subjects ---
+        # validation 
         val_pats_list = pd.read_csv(
-            os.path.join("net", "datasets", "SZ2_validation.tsv"),
-            sep="\t",
+            os.path.join('net', 'datasets', 'SZ2_validation.tsv'),
+            sep='\t',
             header=None,
             skiprows=[0, 1, 2],
         )[0].to_list()
 
         val_recs_list = [
-            [s, r.split("_")[-2]]
+            [s, r.split('_')[-2]]
             for s in val_pats_list
-            for r in os.listdir(os.path.join(config.data_path, s, "ses-01", "eeg"))
-            if "edf" in r
+            for r in os.listdir(os.path.join(config.data_path, s, 'ses-01', 'eeg'))
+            if 'edf' in r
         ]
 
         gen_name = f"{config.dataset}_frame-{config.frame}_sampletype-{config.sample_type}"
-        gen_dir = os.path.join("net", "generators")
+        gen_dir = os.path.join('net', 'generators')
         os.makedirs(gen_dir, exist_ok=True)
 
-        meta_train_path = os.path.join(gen_dir, f"meta_train_{gen_name}.pkl")
-        meta_val_path = os.path.join(gen_dir, f"meta_val_{gen_name}.pkl")
-        gen_train_path = os.path.join(gen_dir, f"gen_train_{gen_name}.pkl")
-        gen_val_path = os.path.join(gen_dir, f"gen_val_{gen_name}.pkl")
+        meta_train_path = os.path.join(gen_dir, f'meta_train_{gen_name}.pkl')
+        meta_val_path = os.path.join(gen_dir, f'meta_val_{gen_name}.pkl')
+        gen_train_path = os.path.join(gen_dir, f'gen_train_{gen_name}.pkl')
+        gen_val_path = os.path.join(gen_dir, f'gen_val_{gen_name}.pkl')
 
-        # ----------------------------------------------------------
-        # A) LOAD EXISTING GENERATORS / METADATA
-        # ----------------------------------------------------------
+        # Load or create generators
         if load_generators and os.path.exists(meta_train_path) and os.path.exists(
             meta_val_path
         ):
-            print(f"Loading generator metadata from meta_* pickles for {gen_name}.")
+            print(f'Loading generator metadata from meta_* pickles for {gen_name}.')
 
-            with open(meta_train_path, "rb") as f:
+            with open(meta_train_path, 'rb') as f:
                 meta_train = pickle.load(f)
-            with open(meta_val_path, "rb") as f:
+            with open(meta_val_path, 'rb') as f:
                 meta_val = pickle.load(f)
 
-            train_recs_list = meta_train["recs_list"]
-            train_segments = meta_train["segments"]
-            val_recs_list = meta_val["recs_list"]
-            val_segments = meta_val["segments"]
+            train_recs_list = meta_train['recs_list']
+            train_segments = meta_train['segments']
+            val_recs_list = meta_val['recs_list']
+            val_segments = meta_val['segments']
 
             # 3-class relabel
             train_segments = relabel_segments_to_threeclass(
@@ -200,25 +184,24 @@ def train(config, load_generators: bool, save_generators: bool):
         elif load_generators and os.path.exists(gen_train_path) and os.path.exists(
             gen_val_path
         ):
-            print(f"Loading full generator objects from gen_* pickles for {gen_name}.")
+            print(f'Loading full generator objects from gen_* pickles for {gen_name}.')
 
-            with open(gen_train_path, "rb") as f:
+            with open(gen_train_path, 'rb') as f:
                 gen_train = pickle.load(f)
-            with open(gen_val_path, "rb") as f:
+            with open(gen_val_path, 'rb') as f:
                 gen_val = pickle.load(f)
 
         else:
-            # ------------------------------------------------------
-            # B) BUILD NEW GENERATORS FROM SCRATCH
-            # ------------------------------------------------------
-            print("Generating training segments...")
+
+            # Build new generators from scratch
+            print('Generating training segments...')
             if config.sample_type == "subsample":
                 train_segments = generate_data_keys_subsample(
                     config, train_recs_list
                 )
             else:
                 raise NotImplementedError(
-                    f"sample_type {config.sample_type} not implemented."
+                    f'sample_type {config.sample_type} not implemented.'
                 )
 
             # 3-class relabel
@@ -235,7 +218,7 @@ def train(config, load_generators: bool, save_generators: bool):
             )
 
             # Validation segments
-            print("Generating validation segments...")
+            print('Generating validation segments...')
             val_segments = generate_data_keys_sequential_window(
                 config, val_recs_list, 5 * 60
             )
@@ -252,40 +235,36 @@ def train(config, load_generators: bool, save_generators: bool):
             )
 
             if save_generators:
-                print("Saving generator metadata to net/generators/ ...")
+                print('Saving generator metadata to net/generators/ ...')
 
                 meta_train = {
-                    "recs_list": train_recs_list,
-                    "segments": train_segments,
+                    'recs_list': train_recs_list,
+                    'segments': train_segments,
                 }
-                meta_val = {"recs_list": val_recs_list, "segments": val_segments}
+                meta_val = {'recs_list': val_recs_list, 'segments': val_segments}
 
-                with open(meta_train_path, "wb") as f:
+                with open(meta_train_path, 'wb') as f:
                     pickle.dump(meta_train, f, pickle.HIGHEST_PROTOCOL)
-                with open(meta_val_path, "wb") as f:
+                with open(meta_val_path, 'wb') as f:
                     pickle.dump(meta_val, f, pickle.HIGHEST_PROTOCOL)
 
-                with open(gen_train_path, "wb") as f:
+                with open(gen_train_path, 'wb') as f:
                     pickle.dump(gen_train, f, pickle.HIGHEST_PROTOCOL)
-                with open(gen_val_path, "wb") as f:
+                with open(gen_val_path, 'wb') as f:
                     pickle.dump(gen_val, f, pickle.HIGHEST_PROTOCOL)
 
-        # ----------------------------------------------------------
-        # TRAIN
-        # ----------------------------------------------------------
-        print("### Training model....")
+        
+        print('Training model....')
         model = net(config)
 
         start_train = time.time()
         train_net(config, model, gen_train, gen_val, model_save_path)
         end_train = time.time() - start_train
 
-        print("Total train duration = ", end_train / 60.0, "minutes")
+        print('Total train duration = ', end_train / 60.0, 'minutes')
 
 
-# -------------------------------------------------------
-# PREDICT
-# -------------------------------------------------------
+
 def predict(config):
     """
     Run prediction on test set and save y_pred / y_true to HDF5.
@@ -293,53 +272,53 @@ def predict(config):
     NOTE: we store 1D probabilities and labels for pre-ictal (class 1).
     """
     name = config.get_name()
-    model_save_path = os.path.join(config.save_dir, "models", name)
+    model_save_path = os.path.join(config.save_dir, 'models', name)
 
-    pred_root = os.path.join(config.save_dir, "predictions")
+    pred_root = os.path.join(config.save_dir, 'predictions')
     os.makedirs(pred_root, exist_ok=True)
     pred_path = os.path.join(pred_root, name)
     os.makedirs(pred_path, exist_ok=True)
 
     test_pats_list = pd.read_csv(
-        os.path.join("net", "datasets", config.dataset + "_test.tsv"),
-        sep="\t",
+        os.path.join('net', 'datasets', config.dataset + '_test.tsv'),
+        sep='\t',
         header=None,
         skiprows=[0, 1, 2],
     )[0].to_list()
 
     test_recs_list = [
-        [s, r.split("_")[-2]]
+        [s, r.split('_')[-2]]
         for s in test_pats_list
-        for r in os.listdir(os.path.join(config.data_path, s, "ses-01", "eeg"))
-        if "edf" in r
+        for r in os.listdir(os.path.join(config.data_path, s, 'ses-01', 'eeg'))
+        if 'edf' in r
     ]
 
     model_weights_path = os.path.join(
-        model_save_path, "Weights", name + ".weights.h5"
+        model_save_path, 'Weights', name + '.weights.h5'
     )
 
     # reload training config
     config.load_config(
-        config_path=os.path.join(model_save_path, "configs"),
-        config_name=name + ".cfg",
+        config_path=os.path.join(model_save_path, 'configs'),
+        config_name=name + '.cfg',
     )
 
     # model definition must match training
-    if config.model == "DeepConvNet":
+    if config.model == 'DeepConvNet':
         from net.DeepConv_Net import net
-    elif config.model == "ChronoNet":
+    elif config.model == 'ChronoNet':
         from net.ChronoNet import net
-    elif config.model == "EEGnet":
+    elif config.model == 'EEGnet':
         from net.EEGnet import net
     else:
-        raise ValueError(f"Unknown model: {config.model}")
+        raise ValueError(f'Unknown model: {config.model}')
 
     for rec in tqdm(test_recs_list):
         out_file = os.path.join(
-            pred_path, rec[0] + "_" + rec[1] + "preds.h5"
+            pred_path, rec[0] + '_' + rec[1] + 'preds.h5'
         )
         if os.path.isfile(out_file):
-            print(rec[0] + " " + rec[1] + " exists. Skipping...")
+            print(rec[0] + ' ' + rec[1] + ' exists. Skipping...')
             continue
 
         segments = generate_data_keys_sequential(
@@ -362,36 +341,25 @@ def predict(config):
 
         y_pred, y_true = predict_net(gen_test, model_weights_path, model)
 
-        with h5py.File(out_file, "w") as f:
-            f.create_dataset("y_pred", data=y_pred)
-            f.create_dataset("y_true", data=y_true)
+        with h5py.File(out_file, 'w') as f:
+            f.create_dataset('y_pred', data=y_pred)
+            f.create_dataset('y_true', data=y_true)
 
         gc.collect()
 
 
-# -------------------------------------------------------
-# EVALUATE
-# -------------------------------------------------------
 def evaluate(config):
-    """
-    Evaluate predictions and save metrics to results HDF5.
-
-    Uses pre-ictal probability (saved from predict()) and computes:
-    - sens_ovlp (any-overlap)
-    - FA/h (epoch & overlap)
-    - etc., via get_metrics_scoring
-    """
     name = config.get_name()
 
-    pred_path = os.path.join(config.save_dir, "predictions", name)
+    pred_path = os.path.join(config.save_dir, 'predictions', name)
     pred_fs = 1  # 1 Hz (one prediction per second)
 
     thresholds = list(np.around(np.linspace(0, 1, 51), 2))
     x_plot = np.linspace(0, 200, 200)
 
-    results_root = os.path.join(config.save_dir, "results")
+    results_root = os.path.join(config.save_dir, 'results')
     os.makedirs(results_root, exist_ok=True)
-    result_file = os.path.join(results_root, name + ".h5")
+    result_file = os.path.join(results_root, name + '.h5')
 
     sens_ovlp = []
     prec_ovlp = []
@@ -408,14 +376,14 @@ def evaluate(config):
 
     score = []
 
-    print("Getting evaluation metrics...")
+    print('Getting evaluation metrics...')
 
     pred_files = sorted(os.listdir(pred_path))
 
     for file in tqdm(pred_files):
-        with h5py.File(os.path.join(pred_path, file), "r") as f:
-            y_pred = list(f["y_pred"])
-            y_true = list(f["y_true"])
+        with h5py.File(os.path.join(pred_path, file), 'r') as f:
+            y_pred = list(f['y_pred'])
+            y_true = list(f['y_true'])
 
         sens_ovlp_th = []
         prec_ovlp_th = []
@@ -430,19 +398,18 @@ def evaluate(config):
         score_th = []
 
         # motion artefact masking (same as original)
-        rec = [file.split("_")[0], file.split("_")[1]]
-        rec_data = Data.loadData(config.data_path, rec, modalities=["eeg"])
+        rec = [file.split('_')[0], file.split('_')[1]]
+        rec_data = Data.loadData(config.data_path, rec, modalities=['eeg'])
 
         [ch_focal, ch_cross] = apply_preprocess_eeg(config, rec_data)
 
         rmsa_f = [
             np.sqrt(np.mean(ch_focal[start : start + 2 * config.fs] ** 2))
-            for start in range(0, len(ch_focal) - 2 * config.fs + 1, config.fs)
-        ]
+            for start in range(0, len(ch_focal) - 2 * config.fs + 1, config.fs)]
+        
         rmsa_c = [
             np.sqrt(np.mean(ch_cross[start : start + 2 * config.fs] ** 2))
-            for start in range(0, len(ch_focal) - 2 * config.fs + 1, config.fs)
-        ]
+            for start in range(0, len(ch_focal) - 2 * config.fs + 1, config.fs)]
 
         rmsa_f = [1 if 13 < rms < 150 else 0 for rms in rmsa_f]
         rmsa_c = [1 if 13 < rms < 150 else 0 for rms in rmsa_c]
@@ -508,19 +475,19 @@ def evaluate(config):
         prec_ovlp_plot.append(y_plot)
 
     score_05 = [x[25] for x in score]
-    print("Score: " + "%.2f" % np.nanmean(score_05))
+    print('Score: ' + '%.2f' % np.nanmean(score_05))
 
-    with h5py.File(result_file, "w") as f:
-        f.create_dataset("sens_ovlp", data=sens_ovlp)
-        f.create_dataset("prec_ovlp", data=prec_ovlp)
-        f.create_dataset("fah_ovlp", data=fah_ovlp)
-        f.create_dataset("f1_ovlp", data=f1_ovlp)
-        f.create_dataset("sens_ovlp_plot", data=sens_ovlp_plot)
-        f.create_dataset("prec_ovlp_plot", data=prec_ovlp_plot)
-        f.create_dataset("x_plot", data=x_plot)
-        f.create_dataset("sens_epoch", data=sens_epoch)
-        f.create_dataset("spec_epoch", data=spec_epoch)
-        f.create_dataset("prec_epoch", data=prec_epoch)
-        f.create_dataset("fah_epoch", data=fah_epoch)
-        f.create_dataset("f1_epoch", data=f1_epoch)
-        f.create_dataset("score", data=score)
+    with h5py.File(result_file, 'w') as f:
+        f.create_dataset('sens_ovlp', data=sens_ovlp)
+        f.create_dataset('prec_ovlp', data=prec_ovlp)
+        f.create_dataset('fah_ovlp', data=fah_ovlp)
+        f.create_dataset('f1_ovlp', data=f1_ovlp)
+        f.create_dataset('sens_ovlp_plot', data=sens_ovlp_plot)
+        f.create_dataset('prec_ovlp_plot', data=prec_ovlp_plot)
+        f.create_dataset('x_plot', data=x_plot)
+        f.create_dataset('sens_epoch', data=sens_epoch)
+        f.create_dataset('spec_epoch', data=spec_epoch)
+        f.create_dataset('prec_epoch', data=prec_epoch)
+        f.create_dataset('fah_epoch', data=fah_epoch)
+        f.create_dataset('f1_epoch', data=f1_epoch)
+        f.create_dataset('score', data=score)

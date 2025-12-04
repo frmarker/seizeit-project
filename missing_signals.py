@@ -36,7 +36,7 @@ print(f"Total recordings: {total}")
 print("")
 print(f"Missing EEG only: {missing_eeg}  ({100*missing_eeg/total:.2f}%)")
 print(f"Missing ECG only: {missing_ecg}  ({100*missing_ecg/total:.2f}%)")
-print(f"Missing BOTH:     {missing_both} ({100*missing_both/total:.2f}%)")
+print(f"Missing BOTH: {missing_both} ({100*missing_both/total:.2f}%)")
 print("")
-print(f"Valid EEG+ECG:    {total - (missing_eeg + missing_ecg + missing_both)} "
+print(f"Valid EEG+ECG: {total - (missing_eeg + missing_ecg + missing_both)} "
       f"({100*(total - (missing_eeg + missing_ecg + missing_both))/total:.2f}%)")

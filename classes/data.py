@@ -1,110 +1,181 @@
+import os
 import numpy as np
+import warnings
+import mne
 
 
 class Data:
-    def __init__(self, data, channels, fs):
-        self.data = data            # list[np.ndarray]
-        self.channels = channels    # tuple[str]
-        self.fs = fs                # tuple[float]
+    """
+    Simple container class for EEG/ECG data loaded from EDF.
+    """
+
+    def __init__(self, data=None, channels=None, fs=None):
+        self.data = data if data is not None else []         # list[np.ndarray]
+        self.channels = channels if channels is not None else ()  # tuple[str]
+        self.fs = fs if fs is not None else ()               # tuple[float]
 
     @classmethod
-    def loadData(
-        cls,
-        data_path,
-        recording,
-        modalities,
-    ):
+    def empty(cls):
+        """Returns a clean EMPTY Data object."""
+        return cls(data=[], channels=(), fs=())
+
+    @classmethod
+    def loadData(cls, data_path, recording, modalities=("eeg",)):
         """
-        Instantiate a Data instance from EDF files.
+        Loads EEG/ECG data from EDF files with robust error checking.
+        This function now:
+            • enforces BIDS run + modality matching
+            • detects broken symlinks
+            • checks EDF readability using MNE
+            • treats EEG as required and ECG as optional
 
-        Args:
-            data_path (str): base path to the BIDS dataset
-            recording (tuple[str]): (subject, run), e.g. ('sub-001', 'run-01')
-            modalities (tuple[str] | list[str]): which modalities to load
-                (e.g. ('eeg',) or ('eeg', 'ecg'))
+        Args
+        ----
+        data_path : str
+            Path to BIDS dataset root
+        recording : tuple[str]
+            (subject, run), e.g. ('sub-001', 'run-01')
+        modalities : list[str] or tuple[str]
+            Which modalities to load, e.g. ("eeg",) or ("eeg","ecg")
 
-        Returns:
-            Data:
-                - Data object if EEG exists (ECG is optional).
-                - Empty Data (data=[], channels=(), fs=()) if EEG missing or unreadable.
+        Returns
+        -------
+        Data instance (possibly EMPTY)
         """
-        import os
-        import pyedflib
-        import warnings
-
         subj, run = recording
 
-        def find_edf(mod):
-            """Return EDF filepath if it exists, else None."""
-            mod_dir = os.path.join(data_path, subj, "ses-01", mod)
-            if not os.path.isdir(mod_dir):
-                return None
-
-            edf = os.path.join(
-                mod_dir,
-                "_".join(
-                    [subj, "ses-01", "task-szMonitoring", run, mod + ".edf"]
-                ),
+        # Path where EDFs usually sit: <root>/sub-xxx/ses-01/eeg/
+        eeg_dir = os.path.join(data_path, subj, "ses-01", "eeg")
+        if not os.path.isdir(eeg_dir):
+            warnings.warn(
+                f"[Warning] {subj} {run}: EEG directory missing — creating EMPTY Data."
             )
-            return edf if os.path.exists(edf) else None
+            return cls.empty()
 
-        # === Locate EEG (required) ===
-        eeg_file = find_edf("eeg")
+        # List all EDF candidates (EEG+ECG may be mixed here depending on dataset)
+        try:
+            candidates = [f for f in os.listdir(eeg_dir) if f.lower().endswith(".edf")]
+        except FileNotFoundError:
+            warnings.warn(
+                f"[Warning] {subj} {run}: EEG directory missing — creating EMPTY Data."
+            )
+            return cls.empty()
+
+        def match_edf(mod):
+            """
+            Find EDF file matching BOTH:
+                - the run ID (e.g. 'run-01')
+                - the modality token (e.g. '_eeg.' / '_ecg.')
+
+            Returns:
+                full_path or None, and optionally an error message
+            """
+
+            # Filenames must contain both the run number AND the modality
+            edf_list = [
+                f for f in candidates
+                if (run in f) and (f"_{mod}." in f)
+            ]
+
+            if len(edf_list) == 0:
+                return None, f"{mod.upper()} file missing."
+
+            if len(edf_list) > 1:
+                warnings.warn(
+                    f"[Note] {subj} {run}: multiple {mod.upper()} EDFs found, "
+                    f"using {edf_list[0]}"
+                )
+
+            path = os.path.join(eeg_dir, edf_list[0])
+
+            # Symlink integrity check
+            if os.path.islink(path):
+                real = os.path.realpath(path)
+                if not os.path.exists(real):
+                    return None, (
+                        f"{mod.upper()} EDF symlink broken: {path} → {real}"
+                    )
+
+            # Check readability with MNE (before loading big data)
+            try:
+                _ = mne.io.read_raw_edf(path, preload=False, verbose="ERROR")
+            except Exception as e:
+                return None, (
+                    f"{mod.upper()} EDF unreadable: {path} (error: {e})"
+                )
+
+            return path, None
+
+        # ==== REQUIRED: EEG ====
+        eeg_file, eeg_err = match_edf("eeg")
         if eeg_file is None:
             warnings.warn(
-                f"[Warning] {subj} {run}: EEG file missing — creating EMPTY Data object."
+                f"[Warning] {subj} {run}: {eeg_err} — creating EMPTY Data."
             )
-            return cls(data=[], channels=(), fs=())
+            return cls.empty()
 
-        # === ECG is OPTIONAL ===
-        ecg_file = find_edf("ecg")
-        has_ecg = ecg_file is not None
-
-        if not has_ecg:
-            # Single, clear note per recording when ECG is missing
+        # ==== OPTIONAL: ECG ====
+        ecg_file, ecg_err = match_edf("ecg")
+        if ecg_file is None:
             warnings.warn(
-                f"[Note] {subj} {run}: ECG missing — continuing with EEG only.",
-                stacklevel=2,
+                f"[Note] {subj} {run}: {ecg_err} — continuing with EEG only.",
+                stacklevel=2
             )
 
-        data = []
-        channels = []
-        sampling_frequencies = []
+        # Begin loading data
+        loaded_data = []
+        loaded_channels = []
+        loaded_fs = []
 
-        for mod in modalities:
-            # Map modality to actual file path
-            if mod == "eeg":
-                mod_file = eeg_file
-            elif mod == "ecg" and has_ecg:
-                mod_file = ecg_file
-            else:
-                # Either unsupported modality or ECG requested but not available
-                continue
-
+        def load_mod(path, mod_name):
+            """Load EDF signals robustly using MNE."""
             try:
-                import pyedflib  # in case file is imported without it at top
-                with pyedflib.EdfReader(mod_file) as edf:
-                    sampling_frequencies.extend(edf.getSampleFrequencies())
-                    channels.extend(edf.getSignalLabels())
-                    n = edf.signals_in_file
-                    for i in range(n):
-                        data.append(edf.readSignal(i))
-            except OSError as e:
+                raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
+            except Exception as e:
                 warnings.warn(
-                    f"{mod_file}: read error ({e}). Returning EMPTY Data object."
+                    f"[Warning] {subj} {run}: failed reading {mod_name.upper()} "
+                    f"('{path}') — {e}. Returning EMPTY Data."
                 )
-                return cls(data=[], channels=(), fs=())
+                return None
 
-        if len(data) == 0:
+            # Extract signals, channels, and sampling rates
+            ds = raw.get_data()  # shape (n_channels, n_samples)
+            ch = raw.info["ch_names"]
+            sf = [raw.info["sfreq"]] * len(ch)
+
+            return ds, ch, sf
+
+        # Load EEG
+        res = load_mod(eeg_file, "eeg")
+        if res is None:
+            return cls.empty()
+        data_eeg, channels_eeg, fs_eeg = res
+
+        loaded_data.append(data_eeg)
+        loaded_channels.extend(channels_eeg)
+        loaded_fs.extend(fs_eeg)
+
+        # Load ECG if available
+        if ("ecg" in modalities) and (ecg_file is not None):
+            res = load_mod(ecg_file, "ecg")
+            if res is not None:
+                data_ecg, channels_ecg, fs_ecg = res
+                loaded_data.append(data_ecg)
+                loaded_channels.extend(channels_ecg)
+                loaded_fs.extend(fs_ecg)
+
+        # Concatenate data arrays along channel axis
+        if len(loaded_data) == 0:
             warnings.warn(
-                f"No data loaded for {subj} {run}. Returning EMPTY Data object."
+                f"[Warning] {subj} {run}: No data loaded — returning EMPTY Data."
             )
-            return cls(data=[], channels=(), fs=())
+            return cls.empty()
 
-        data = [np.asarray(d, dtype=np.float32) for d in data]
+        # Stack modalities along the channel dimension
+        full_data = np.concatenate(loaded_data, axis=0)
 
         return cls(
-            data=data,
-            channels=tuple(channels),
-            fs=tuple(sampling_frequencies),
+            data=[d.astype(np.float32) for d in full_data],
+            channels=tuple(loaded_channels),
+            fs=tuple(loaded_fs),
         )

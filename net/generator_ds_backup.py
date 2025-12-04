@@ -30,8 +30,8 @@ class SequentialGenerator(keras.utils.Sequence):
             shape=(n_segs, frame_len, config.CH),
             dtype=np.float32,
         )
-        # labels: [non pre-ictal, pre-ictal]
-        self.labels = np.empty(shape=(n_segs, 2), dtype=np.float32)
+        # labels: [non-pre-ictal, pre-ictal]
+        self.labels = np.empty(shape = (n_segs, 2), dtype=np.float32)
 
         pbar = tqdm(total=n_segs, disable=not self.verbose)
 
@@ -53,7 +53,7 @@ class SequentialGenerator(keras.utils.Sequence):
                     raw = Data.loadData(
                         self.config.data_path,
                         self.recs[curr_rec],
-                        modalities=modalities,
+                        modalities = modalities,
                     )
                     # If nothing loaded at all, or some requested modalities are missing,
                     # skip this recording entirely.
@@ -75,7 +75,7 @@ class SequentialGenerator(keras.utils.Sequence):
             start_seg = int(s[1] * config.fs)
             stop_seg = int(s[2] * config.fs)
 
-            # safety: pad with zeros if beyond recording length
+            # Pad with zeros if beyond recording length
             if stop_seg > len(rec_data[0]):
                 self.data_segs[count, :, 0] = np.zeros(frame_len, dtype=np.float32)
                 self.data_segs[count, :, 1] = np.zeros(frame_len, dtype=np.float32)
@@ -83,13 +83,13 @@ class SequentialGenerator(keras.utils.Sequence):
                 self.data_segs[count, :, 0] = rec_data[0][start_seg:stop_seg]
                 self.data_segs[count, :, 1] = rec_data[1][start_seg:stop_seg]
 
-            # 2-class labels: 0=non-pre-ictal (interictal + ictal), 1=pre-ictal
+            # 2-class labels: 0 = non pre-ictal (interictal + ictal), 1 = pre-ictal
             lbl = int(s[3])
             if lbl == 1:
                 # pre-ictal
                 self.labels[count, :] = [0, 1]
             else:
-                # non pre-ictal (interictal + ictal collapsed)
+                # non-pre-ictal (interictal + ictal collapsed)
                 self.labels[count, :] = [1, 0]
 
             count += 1
@@ -137,8 +137,8 @@ class SequentialGenerator(keras.utils.Sequence):
 
 class SegmentedGenerator(keras.utils.Sequence):
 
-    def __init__(self, config, recs, segments, batch_size=32,
-                 shuffle=True, verbose=True):
+    def __init__(self, config, recs, segments, batch_size = 32,
+                 shuffle = True, verbose = True):
         super().__init__()
 
         self.config = config
@@ -153,12 +153,12 @@ class SegmentedGenerator(keras.utils.Sequence):
         frame_len = int(config.frame * config.fs)
 
         self.data_segs = np.empty(
-            shape = (n_segs, frame_len, config.CH),
-            dtype = np.float32,)
-        
-        self.labels = np.empty(shape = (n_segs, 2), dtype = np.float32)
+            shape=(n_segs, frame_len, config.CH),
+            dtype=np.float32,
+        )
+        self.labels = np.empty(shape=(n_segs, 2), dtype=np.float32)
 
-        segs_to_load = list(segments) 
+        segs_to_load = list(segments)  # copy
         pbar = tqdm(total=len(segs_to_load), disable=not self.verbose)
 
         count = 0
@@ -183,11 +183,8 @@ class SegmentedGenerator(keras.utils.Sequence):
                 if len(raw.data) < len(modalities):
                     print(
                         f'Skipping {self.recs[curr_rec][0]} {self.recs[curr_rec][1]} '
-                        f'(missing modalities: got {len(raw.data)}, expected {len(modalities)})'
-                    )
-                    segs_to_load = [
-                        s for i, s in enumerate(segs_to_load) if i not in comm_recs
-                    ]
+                        f'(missing modalities: got {len(raw.data)}, expected {len(modalities)})')
+                    segs_to_load = [s for i, s in enumerate(segs_to_load) if i not in comm_recs]
                     pbar.update(len(comm_recs))
                     continue
                 rec_data = apply_preprocess_eeg(self.config, raw)
@@ -205,7 +202,7 @@ class SegmentedGenerator(keras.utils.Sequence):
                     self.data_segs[count, :, 0] = rec_data[0][start_seg:stop_seg]
                     self.data_segs[count, :, 1] = rec_data[1][start_seg:stop_seg]
 
-                # 2-class labels: 0 = non pre-ictal (interictal + ictal), 1 = pre-ictal
+                # 2-class labels: 0 = non pre-ictal (interictal + ictal), 1=pre-ictal
                 lbl = int(seg[3])
                 if lbl == 1:
                     # pre-ictal

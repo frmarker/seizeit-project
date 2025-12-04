@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 
-DATA_PATH = "/Users/rosalouisemarker/Desktop/Digital Media Project/dataset"  # <- adjust
+DATA_PATH = "/Users/rosalouisemarker/Desktop/Digital Media Project/dataset"
 
 out_tsv = "net/datasets/SZ2_all_subjects.tsv"
 os.makedirs(os.path.dirname(out_tsv), exist_ok=True)

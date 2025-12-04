@@ -1,3 +1,4 @@
+from tensorflow import keras
 from tensorflow.keras.layers import (
     Input,
     Conv1D,
@@ -13,8 +14,11 @@ from tensorflow.keras.models import Model
 
 def net(config):
     """
-    ChronoNet-style architecture for 3-class classification:
-    0 = interictal, 1 = pre-ictal, 2 = ictal.
+    ChronoNet-style architecture for binary pre-ictal detection.
+
+    Labels (after remapping):
+    0 = non-pre-ictal (interictal + ictal)
+    1 = pre-ictal
     """
 
     n_samples = int(config.frame * config.fs)
@@ -58,10 +62,10 @@ def net(config):
 
     g_final = GRU(32, return_sequences=False)(g_cat2)
 
-    # ---- Output: 3 classes softmax ----
-    logits = Dense(3, name="dense")(g_final)
+    # ---- Output: 2-class softmax (0=non-pre-ictal, 1=pre-ictal) ----
+    logits = Dense(2, name="dense")(g_final)
     out = Softmax(name="softmax")(logits)
 
-    model = Model(inputs=inp, outputs=out, name="ChronoNet_3class")
+    model = Model(inputs=inp, outputs=out, name="ChronoNet_binary_preictal")
 
     return model
